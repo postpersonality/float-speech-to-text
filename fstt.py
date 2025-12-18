@@ -247,6 +247,11 @@ class AppSettings:
     PP_MAX_RETRIES = 2
     PP_TIMEOUT_SEC = 60
 
+    # OpenAI settings from environment
+    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+    OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
+    OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gemini-2.5-flash")
+
     # Таймауты и задержки
     PASTE_DELAY_MS = 200
     RESTART_DELAY_SEC = 0.1
@@ -702,30 +707,27 @@ class PostProcessingService:
 
     def __init__(self, config: AppConfig):
         self.config = config
-        self.api_key = os.environ.get("OPENAI_API_KEY")
-        self.base_url = os.environ.get("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
-        self.model = os.environ.get("OPENAI_MODEL", "gemini-2.5-flash")
         self.prompt = load_prompt_from_file(config.settings.PP_PROMPT_FILE, "You are a helpful assistant.")
 
     def process(self, text: str) -> str:
         """Отправляет текст в LLM и возвращает обработанный результат"""
-        if not self.api_key:
+        if not self.config.settings.OPENAI_API_KEY:
             log("⚠️  OPENAI_API_KEY не найден. Пост-обработка отключена.")
             return text
 
-        log(f"🧠 Отправка текста в LLM (модель: {self.model})...")
+        log(f"🧠 Отправка текста в LLM (модель: {self.config.settings.OPENAI_MODEL})...")
 
         for attempt in range(self.config.settings.PP_MAX_RETRIES):
             try:
                 with httpx.Client(timeout=self.config.settings.PP_TIMEOUT_SEC) as client:
                     response = client.post(
-                        f"{self.base_url.rstrip('/')}/chat/completions",
+                        f"{self.config.settings.OPENAI_BASE_URL.rstrip('/')}/chat/completions",
                         headers={
-                            "Authorization": f"Bearer {self.api_key}",
+                            "Authorization": f"Bearer {self.config.settings.OPENAI_API_KEY}",
                             "Content-Type": "application/json",
                         },
                         json={
-                            "model": self.model,
+                            "model": self.config.settings.OPENAI_MODEL,
                             "messages": [
                                 {"role": "system", "content": self.prompt},
                                 {"role": "user", "content": text},
