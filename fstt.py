@@ -242,7 +242,7 @@ class AppSettings:
     COPY_METHOD = "clipboard"  # "primary", "clipboard"
     AUTO_PASTE = True
     PP_ENABLED = True
-    PP_PROMPT_FILE = "prompt_v2.md"
+    PP_PROMPT_FILE = "prompt_v3.md"
     PP_TEMPERATURE = 1.0
     PP_MAX_RETRIES = 2
 
