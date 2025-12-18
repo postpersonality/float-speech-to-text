@@ -700,8 +700,8 @@ class PostProcessingService:
     def __init__(self, config: AppConfig):
         self.config = config
         self.api_key = os.environ.get("OPENAI_API_KEY")
-        self.base_url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
-        self.model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        self.base_url = os.environ.get("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
+        self.model = os.environ.get("OPENAI_MODEL", "gemini-pro")
 
     def process(self, text: str) -> str:
         """Отправляет текст в LLM и возвращает обработанный результат"""
