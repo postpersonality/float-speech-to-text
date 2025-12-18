@@ -245,6 +245,7 @@ class AppSettings:
     PP_PROMPT_FILE = "prompt_v3.md"
     PP_TEMPERATURE = 1.0
     PP_MAX_RETRIES = 2
+    PP_TIMEOUT_SEC = 60
 
     # Таймауты и задержки
     PASTE_DELAY_MS = 200
@@ -716,7 +717,7 @@ class PostProcessingService:
 
         for attempt in range(self.config.settings.PP_MAX_RETRIES):
             try:
-                with httpx.Client(timeout=10.0) as client:
+                with httpx.Client(timeout=self.config.settings.PP_TIMEOUT_SEC) as client:
                     response = client.post(
                         f"{self.base_url.rstrip('/')}/chat/completions",
                         headers={
