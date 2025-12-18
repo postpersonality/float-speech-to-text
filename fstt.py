@@ -410,6 +410,7 @@ class ClipboardService:
         try:
             import pyclip
             pyclip.copy(text)
+            log("📋 Скопировано в буфер обмена")
             return True
         except ImportError:
             log("⚠️  pyclip не установлен, используйте: pip install pyclip")
@@ -451,6 +452,7 @@ class ClipboardService:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True
             )
+            log("🖱️  Скопировано в primary selection через wl-copy")
             return True
         except Exception as e:
             log(f"❌ Ошибка при использовании wl-copy: {e}")
@@ -467,6 +469,7 @@ class ClipboardService:
             stdout, stderr = process.communicate(input=text.encode('utf-8'))
 
             if process.returncode == 0:
+                log("🖱️  Скопировано в primary selection через xsel")
                 return True
             else:
                 log(f"⚠️  xsel вернул код {process.returncode}: {stderr.decode('utf-8', errors='ignore')}")
@@ -486,6 +489,7 @@ class ClipboardService:
             stdout, stderr = process.communicate(input=text.encode('utf-8'))
 
             if process.returncode == 0:
+                log("🖱️  Скопировано в primary selection через xclip")
                 return True
             else:
                 log(f"⚠️  xclip вернул код {process.returncode}: {stderr.decode('utf-8', errors='ignore')}")
@@ -500,6 +504,7 @@ class ClipboardService:
             clipboard = Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY)
             clipboard.set_text(text, -1)
             clipboard.store()
+            log("🖱️  Скопировано в primary selection через GTK")
             return True
         except Exception as e:
             log(f"❌ Ошибка копирования в primary selection через GTK: {e}")
@@ -537,6 +542,7 @@ class PasteService:
         try:
             # wtype -M ctrl -k v -m ctrl
             subprocess.run(['wtype', '-M', 'ctrl', '-k', 'v', '-m', 'ctrl'], check=True)
+            log("⌨️  Выполнена вставка из clipboard (Ctrl+V) через wtype")
             return True
         except Exception as e:
             log(f"❌ Ошибка при выполнении wtype: {e}")
@@ -551,6 +557,7 @@ class PasteService:
         try:
             # wtype -M shift -k Insert -m shift
             subprocess.run(['wtype', '-M', 'shift', '-k', 'Insert', '-m', 'shift'], check=True)
+            log("⌨️  Выполнена вставка из primary selection (Shift+Insert) через wtype")
             return True
         except Exception as e:
             log(f"❌ Ошибка при выполнении wtype: {e}")
