@@ -249,8 +249,10 @@ class AppSettings:
 
     # OpenAI settings from environment
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-    OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
-    OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gemini-2.5-flash")
+#    OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
+#    OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gemini-2.5-flash")
+    OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
     # Таймауты и задержки
     PASTE_DELAY_MS = 200
