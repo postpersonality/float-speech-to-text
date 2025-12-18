@@ -244,6 +244,7 @@ class AppSettings:
     PP_ENABLED = True
     PP_PROMPT = load_prompt_from_file("prompt.md", "You are a helpful assistant.")
     PP_TEMPERATURE = 1.0
+    PP_MAX_RETRIES = 2
 
     # Таймауты и задержки
     PASTE_DELAY_MS = 200
@@ -712,40 +713,45 @@ class PostProcessingService:
 
         log(f"🧠 Отправка текста в LLM (модель: {self.model})...")
 
-        try:
-            with httpx.Client(timeout=10.0) as client:
-                response = client.post(
-                    f"{self.base_url.rstrip('/')}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": self.model,
-                        "messages": [
-                            {"role": "system", "content": self.config.settings.PP_PROMPT},
-                            {"role": "user", "content": text},
-                        ],
-                        "temperature": self.config.settings.PP_TEMPERATURE,
-                    },
-                )
-                response.raise_for_status()
-                result = response.json()
+        for attempt in range(self.config.settings.PP_MAX_RETRIES):
+            try:
+                with httpx.Client(timeout=10.0) as client:
+                    response = client.post(
+                        f"{self.base_url.rstrip('/')}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": self.model,
+                            "messages": [
+                                {"role": "system", "content": self.config.settings.PP_PROMPT},
+                                {"role": "user", "content": text},
+                            ],
+                            "temperature": self.config.settings.PP_TEMPERATURE,
+                        },
+                    )
+                    response.raise_for_status()
+                    result = response.json()
 
-                processed_text = result["choices"][0]["message"]["content"].strip()
-                log(f"✅ LLM вернул обработанный текст: {processed_text}")
-                return processed_text
+                    processed_text = result["choices"][0]["message"]["content"].strip()
+                    log(f"✅ LLM вернул обработанный текст: {processed_text}")
+                    return processed_text
 
-        except httpx.RequestError as e:
-            log(f"❌ Ошибка сети при обращении к LLM: {e}")
-        except httpx.HTTPStatusError as e:
-            log(f"❌ Ошибка API LLM (статус: {e.response.status_code}): {e.response.text}")
-        except (KeyError, IndexError) as e:
-            log(f"❌ Неожиданный формат ответа от LLM: {e}")
-        except Exception as e:
-            log(f"❌ Неизвестная ошибка при пост-обработке: {e}")
+            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+                log(f"❌ Ошибка при обращении к LLM (попытка {attempt + 1}): {e}")
+                if attempt < self.config.settings.PP_MAX_RETRIES - 1:
+                    time.sleep(1)  # Пауза перед повторной попыткой
+                continue
+            except (KeyError, IndexError) as e:
+                log(f"❌ Неожиданный формат ответа от LLM: {e}")
+                break  # Не повторяем при ошибках парсинга
+            except Exception as e:
+                log(f"❌ Неизвестная ошибка при пост-обработке: {e}")
+                break  # Не повторяем при других ошибках
 
         # Fallback - возвращаем исходный текст
+        log("⚠️  Не удалось получить ответ от LLM после нескольких попыток.")
         return text
 
 
