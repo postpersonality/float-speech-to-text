@@ -18,6 +18,7 @@ import os
 import subprocess
 import shutil
 import shlex
+import httpx
 import gi
 from enum import Enum
 from typing import Callable, Optional, Protocol, Dict, Set
@@ -33,6 +34,19 @@ def log(message):
     print(message, file=sys.stderr)
 
 
+def load_prompt_from_file(file_path: str, default_prompt: str) -> str:
+    """Загружает текст промпта из файла"""
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read().strip()
+        else:
+            log(f"⚠️  Файл с промптом не найден: {file_path}")
+    except Exception as e:
+        log(f"❌ Ошибка загрузки промпта из файла: {e}")
+    return default_prompt
+
+
 # ============================================================================
 # STATE MACHINE
 # ============================================================================
@@ -42,6 +56,7 @@ class AppState(Enum):
     IDLE = "idle"           # Готов к записи
     RECORDING = "recording" # Идёт запись
     PROCESSING = "processing" # Обработка записи
+    POST_PROCESSING = "post_processing" # Пост-обработка текста
     RESTARTING = "restarting" # Перезапуск записи
 
 
@@ -52,7 +67,8 @@ class UIStateMachine:
     VALID_TRANSITIONS: Dict[AppState, Set[AppState]] = {
         AppState.IDLE: {AppState.RECORDING},
         AppState.RECORDING: {AppState.PROCESSING, AppState.RESTARTING, AppState.IDLE},
-        AppState.PROCESSING: {AppState.IDLE},
+        AppState.PROCESSING: {AppState.POST_PROCESSING, AppState.IDLE},
+        AppState.POST_PROCESSING: {AppState.IDLE},
         AppState.RESTARTING: {AppState.RECORDING, AppState.IDLE}
     }
 
@@ -144,6 +160,14 @@ class SpeechProtocol(Protocol):
         ...
 
 
+class PostProcessingProtocol(Protocol):
+    """Протокол для сервиса пост-обработки текста"""
+
+    def process(self, text: str) -> str:
+        """Обрабатывает текст с помощью LLM"""
+        ...
+
+
 # ============================================================================
 # КОНФИГУРАЦИЯ И КОНСТАНТЫ
 # ============================================================================
@@ -167,8 +191,8 @@ class UIConfig:
     ICON_PROCESSING = "⋯"
     ICON_CLOSE = "✕"
     ICON_RESTART = "↻"
-    ICON_AUTOPASTE_ON = "☑"   # Квадрат с галочкой
-    ICON_AUTOPASTE_OFF = "☐"  # Пустой квадрат
+    ICON_PP_ON = "☑"   # Квадрат с галочкой
+    ICON_PP_OFF = "☐"  # Пустой квадрат
     BOX_SPACING = 5
     BOX_MARGIN = 10
     MOUSE_BUTTON_LEFT = 1
@@ -217,6 +241,19 @@ class AppSettings:
     APP_ID = 'com.example.voice_recognition'
     COPY_METHOD = "clipboard"  # "primary", "clipboard"
     AUTO_PASTE = True
+    PP_ENABLED = True
+    PP_PROMPT_FILE = "prompt.md"
+    PP_TEMPERATURE = 1.0
+    PP_MAX_RETRIES = 2
+    PP_TIMEOUT_SEC = 60
+
+    # OpenAI settings from environment
+    OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+#    OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
+#    OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gemini-2.5-flash")
+    OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
     # Таймауты и задержки
     PASTE_DELAY_MS = 200
     RESTART_DELAY_SEC = 0.1
@@ -299,7 +336,8 @@ class ServiceFactory:
         self,
         clipboard_class: type = None,
         paste_class: type = None,
-        speech_class: type = None
+        speech_class: type = None,
+        post_processing_class: type = None
     ):
         """
         Инициализирует фабрику с возможностью внедрения зависимостей.
@@ -308,11 +346,13 @@ class ServiceFactory:
             clipboard_class: Класс для создания сервиса буфера обмена (по умолчанию ClipboardService)
             paste_class: Класс для создания сервиса вставки (по умолчанию PasteService)
             speech_class: Класс для создания сервиса распознавания речи (по умолчанию SpeechService)
+            post_processing_class: Класс для создания сервиса пост-обработки (по умолчанию PostProcessingService)
         """
         # Используем отложенную инициализацию дефолтных классов, чтобы избежать circular dependencies
         self._clipboard_class = clipboard_class
         self._paste_class = paste_class
         self._speech_class = speech_class
+        self._post_processing_class = post_processing_class
 
     @property
     def clipboard_class(self):
@@ -335,6 +375,13 @@ class ServiceFactory:
             return SpeechService
         return self._speech_class
 
+    @property
+    def post_processing_class(self):
+        """Возвращает класс сервиса пост-обработки (ленивая инициализация)"""
+        if self._post_processing_class is None:
+            return PostProcessingService
+        return self._post_processing_class
+
     def create_clipboard(self) -> ClipboardProtocol:
         """Создаёт сервис буфера обмена"""
         return self.clipboard_class()
@@ -347,12 +394,17 @@ class ServiceFactory:
         """Создаёт сервис распознавания речи"""
         return self.speech_class(config)
 
-    def create_all_services(self, config: 'AppConfig') -> tuple[SpeechProtocol, ClipboardProtocol, PasteProtocol]:
+    def create_post_processing(self, config: 'AppConfig') -> PostProcessingProtocol:
+        """Создаёт сервис пост-обработки"""
+        return self.post_processing_class(config)
+
+    def create_all_services(self, config: 'AppConfig') -> tuple[SpeechProtocol, ClipboardProtocol, PasteProtocol, PostProcessingProtocol]:
         """Создаёт все необходимые сервисы"""
         speech = self.create_speech(config)
         clipboard = self.create_clipboard()
         paste = self.create_paste(config.settings.COPY_METHOD)
-        return speech, clipboard, paste
+        post_processing = self.create_post_processing(config)
+        return speech, clipboard, paste, post_processing
 
 
 # ============================================================================
@@ -367,7 +419,7 @@ class ClipboardService:
         try:
             import pyclip
             pyclip.copy(text)
-            log(f"📋 Скопировано в буфер обмена: {text}")
+            log("📋 Скопировано в буфер обмена")
             return True
         except ImportError:
             log("⚠️  pyclip не установлен, используйте: pip install pyclip")
@@ -409,7 +461,7 @@ class ClipboardService:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True
             )
-            log(f"🖱️  Скопировано в primary selection через wl-copy: {text}")
+            log("🖱️  Скопировано в primary selection через wl-copy")
             return True
         except Exception as e:
             log(f"❌ Ошибка при использовании wl-copy: {e}")
@@ -426,7 +478,7 @@ class ClipboardService:
             stdout, stderr = process.communicate(input=text.encode('utf-8'))
 
             if process.returncode == 0:
-                log(f"🖱️  Скопировано в primary selection через xsel: {text}")
+                log("🖱️  Скопировано в primary selection через xsel")
                 return True
             else:
                 log(f"⚠️  xsel вернул код {process.returncode}: {stderr.decode('utf-8', errors='ignore')}")
@@ -446,7 +498,7 @@ class ClipboardService:
             stdout, stderr = process.communicate(input=text.encode('utf-8'))
 
             if process.returncode == 0:
-                log(f"🖱️  Скопировано в primary selection через xclip: {text}")
+                log("🖱️  Скопировано в primary selection через xclip")
                 return True
             else:
                 log(f"⚠️  xclip вернул код {process.returncode}: {stderr.decode('utf-8', errors='ignore')}")
@@ -461,7 +513,7 @@ class ClipboardService:
             clipboard = Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY)
             clipboard.set_text(text, -1)
             clipboard.store()
-            log(f"🖱️  Скопировано в primary selection через GTK: {text}")
+            log("🖱️  Скопировано в primary selection через GTK")
             return True
         except Exception as e:
             log(f"❌ Ошибка копирования в primary selection через GTK: {e}")
@@ -652,6 +704,63 @@ class SpeechService:
             return None
 
 
+class PostProcessingService:
+    """Сервис для пост-обработки текста с помощью LLM"""
+
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.prompt = load_prompt_from_file(config.settings.PP_PROMPT_FILE, "You are a helpful assistant.")
+
+    def process(self, text: str) -> str:
+        """Отправляет текст в LLM и возвращает обработанный результат"""
+        if not self.config.settings.OPENAI_API_KEY:
+            log("⚠️  OPENAI_API_KEY не найден. Пост-обработка отключена.")
+            return text
+
+        log(f"🧠 Отправка текста в LLM (модель: {self.config.settings.OPENAI_MODEL})...")
+
+        for attempt in range(self.config.settings.PP_MAX_RETRIES):
+            try:
+                with httpx.Client(timeout=self.config.settings.PP_TIMEOUT_SEC) as client:
+                    response = client.post(
+                        f"{self.config.settings.OPENAI_BASE_URL.rstrip('/')}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {self.config.settings.OPENAI_API_KEY}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": self.config.settings.OPENAI_MODEL,
+                            "messages": [
+                                {"role": "system", "content": self.prompt},
+                                {"role": "user", "content": text},
+                            ],
+                            "temperature": self.config.settings.PP_TEMPERATURE,
+                        },
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+
+                    processed_text = result["choices"][0]["message"]["content"].strip()
+                    log(f"✅ LLM вернул обработанный текст: {processed_text}")
+                    return processed_text
+
+            except (httpx.RequestError, httpx.HTTPStatusError) as e:
+                log(f"❌ Ошибка при обращении к LLM (попытка {attempt + 1}): {e}")
+                if attempt < self.config.settings.PP_MAX_RETRIES - 1:
+                    time.sleep(1)  # Пауза перед повторной попыткой
+                continue
+            except (KeyError, IndexError) as e:
+                log(f"❌ Неожиданный формат ответа от LLM: {e}")
+                break  # Не повторяем при ошибках парсинга
+            except Exception as e:
+                log(f"❌ Неизвестная ошибка при пост-обработке: {e}")
+                break  # Не повторяем при других ошибках
+
+        # Fallback - возвращаем исходный текст
+        log("⚠️  Не удалось получить ответ от LLM после нескольких попыток.")
+        return text
+
+
 # ============================================================================
 # APPLICATION CONTROLLER (БИЗНЕС-ЛОГИКА)
 # ============================================================================
@@ -713,6 +822,7 @@ class ApplicationController:
         speech: SpeechProtocol,
         clipboard: ClipboardProtocol,
         paste: PasteProtocol,
+        post_processing: PostProcessingProtocol,
         state_machine: UIStateMachine
     ):
         """
@@ -723,12 +833,14 @@ class ApplicationController:
             speech: Сервис распознавания речи
             clipboard: Сервис буфера обмена
             paste: Сервис вставки текста
+            post_processing: Сервис пост-обработки
             state_machine: Машина состояний UI
         """
         self.config = config
         self.speech = speech
         self.clipboard = clipboard
         self.paste_service = paste
+        self.post_processing = post_processing
         self.state_machine = state_machine
 
     def start_recording(self) -> bool:
@@ -811,25 +923,44 @@ class ApplicationController:
 
     def _on_recognition_complete(self, text: Optional[str], callback: Callable[[Optional[str]], None]) -> None:
         """Обработчик завершения распознавания"""
-        if text:
+        if not text:
+            self.state_machine.transition_to(AppState.IDLE)
+            callback(None)
+            return
 
-            # Копируем в буфер обмена в зависимости от настройки
-            if self.config.settings.COPY_METHOD == "clipboard":
-                self.clipboard.copy_standard(text)
-            elif self.config.settings.COPY_METHOD == "primary":
-                self.clipboard.copy_primary(text)
+        log(f"🎤 Распознанный текст: {text}")
 
-            # Автоматическая вставка
-            if self.config.settings.AUTO_PASTE:
-                GLib.timeout_add(
-                    AppSettings.PASTE_DELAY_MS,
-                    lambda: (self.paste_service.paste(), False)[1]
-                )
+        # Если пост-обработка включена, запускаем её
+        if self.config.settings.PP_ENABLED:
+            self.state_machine.transition_to(AppState.POST_PROCESSING)
+            AsyncTaskRunner.run_async(
+                target=lambda: self.post_processing.process(text),
+                callback=lambda processed_text: self._on_post_processing_complete(processed_text, callback)
+            )
+        else:
+            # Иначе, обрабатываем как обычно
+            self._handle_processed_text(text)
+            self.state_machine.transition_to(AppState.IDLE)
+            callback(text)
 
-        # Переходим обратно в состояние IDLE
+    def _on_post_processing_complete(self, processed_text: str, callback: Callable[[str], None]) -> None:
+        """Обработчик завершения пост-обработки"""
+        self._handle_processed_text(processed_text)
         self.state_machine.transition_to(AppState.IDLE)
+        callback(processed_text)
 
-        callback(text)
+    def _handle_processed_text(self, text: str) -> None:
+        """Общая логика обработки текста (копирование и вставка)"""
+        if self.config.settings.COPY_METHOD == "clipboard":
+            self.clipboard.copy_standard(text)
+        elif self.config.settings.COPY_METHOD == "primary":
+            self.clipboard.copy_primary(text)
+
+        if self.config.settings.AUTO_PASTE:
+            GLib.timeout_add(
+                AppSettings.PASTE_DELAY_MS,
+                lambda: (self.paste_service.paste(), False)[1]
+            )
 
 
 # ============================================================================
@@ -869,7 +1000,7 @@ class RecognitionWindow:
         self.window = None
         self.button = None
         self.restart_button = None
-        self.auto_paste_button = None
+        self.pp_button = None
         self.app = None
 
         # Для drag-and-drop
@@ -900,9 +1031,9 @@ class RecognitionWindow:
         if factory is None:
             factory = ServiceFactory()
 
-        speech, clipboard, paste = factory.create_all_services(config)
+        speech, clipboard, paste, post_processing = factory.create_all_services(config)
         state_machine = UIStateMachine()
-        controller = ApplicationController(config, speech, clipboard, paste, state_machine)
+        controller = ApplicationController(config, speech, clipboard, paste, post_processing, state_machine)
         return cls(config, controller, state_machine)
 
     def _update_record_button(self, label: str, is_sensitive: bool = True):
@@ -952,6 +1083,8 @@ class RecognitionWindow:
             self._update_ui_for_recording_state()
         elif new_state == AppState.PROCESSING:
             self._update_ui_for_processing_state()
+        elif new_state == AppState.POST_PROCESSING:
+            self._update_ui_for_processing_state() # Same as processing
         elif new_state == AppState.RESTARTING:
             self._update_ui_for_restarting_state()
 
@@ -1027,18 +1160,18 @@ class RecognitionWindow:
             if self.app:
                 self.app.quit()
 
-    def on_auto_paste_clicked(self, button):
-        """Обработчик нажатия кнопки автовставки"""
-        # Переключаем состояние автовставки
-        self.config.settings.AUTO_PASTE = not self.config.settings.AUTO_PASTE
+    def on_pp_clicked(self, button):
+        """Обработчик нажатия кнопки пост-обработки"""
+        # Переключаем состояние пост-обработки
+        self.config.settings.PP_ENABLED = not self.config.settings.PP_ENABLED
 
         # Обновляем иконку кнопки
-        if self.config.settings.AUTO_PASTE:
-            self.auto_paste_button.set_label(self.config.ui.ICON_AUTOPASTE_ON)
-            log("✅ Автовставка включена")
+        if self.config.settings.PP_ENABLED:
+            self.pp_button.set_label(self.config.ui.ICON_PP_ON)
+            log("✅ Пост-обработка включена")
         else:
-            self.auto_paste_button.set_label(self.config.ui.ICON_AUTOPASTE_OFF)
-            log("⬜ Автовставка выключена")
+            self.pp_button.set_label(self.config.ui.ICON_PP_OFF)
+            log("⬜ Пост-обработка выключена")
 
     def _setup_css_styles(self, screen):
         """Настраивает CSS стили для окна"""
@@ -1101,20 +1234,20 @@ class RecognitionWindow:
         self.button.get_style_context().add_class("record-button")
         self.button.connect("clicked", self.on_button_clicked)
 
-        # Кнопка автовставки
-        initial_autopaste_icon = (self.config.ui.ICON_AUTOPASTE_ON
-                                 if self.config.settings.AUTO_PASTE
-                                 else self.config.ui.ICON_AUTOPASTE_OFF)
-        self.auto_paste_button = Gtk.Button(label=initial_autopaste_icon)
-        self.auto_paste_button.get_style_context().add_class("autopaste-button")
-        self.auto_paste_button.connect("clicked", self.on_auto_paste_clicked)
+        # Кнопка пост-обработки
+        initial_pp_icon = (self.config.ui.ICON_PP_ON
+                                 if self.config.settings.PP_ENABLED
+                                 else self.config.ui.ICON_PP_OFF)
+        self.pp_button = Gtk.Button(label=initial_pp_icon)
+        self.pp_button.get_style_context().add_class("autopaste-button") # Keep old class for styles
+        self.pp_button.connect("clicked", self.on_pp_clicked)
 
         # Сохраняем ссылку на app для возможности закрытия приложения
         self.app = app
 
         box.add(self.restart_button)
         box.add(self.button)
-        box.add(self.auto_paste_button)
+        box.add(self.pp_button)
 
         return box
 
