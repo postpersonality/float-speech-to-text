@@ -242,7 +242,7 @@ class AppSettings:
     COPY_METHOD = "clipboard"  # "primary", "clipboard"
     AUTO_PASTE = True
     PP_ENABLED = True
-    PP_PROMPT = load_prompt_from_file("prompt.md", "You are a helpful assistant.")
+    PP_PROMPT_FILE = "prompt_v2.md"
     PP_TEMPERATURE = 1.0
     PP_MAX_RETRIES = 2
 
@@ -704,6 +704,7 @@ class PostProcessingService:
         self.api_key = os.environ.get("OPENAI_API_KEY")
         self.base_url = os.environ.get("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
         self.model = os.environ.get("OPENAI_MODEL", "gemini-2.5-flash")
+        self.prompt = load_prompt_from_file(config.settings.PP_PROMPT_FILE, "You are a helpful assistant.")
 
     def process(self, text: str) -> str:
         """Отправляет текст в LLM и возвращает обработанный результат"""
@@ -725,7 +726,7 @@ class PostProcessingService:
                         json={
                             "model": self.model,
                             "messages": [
-                                {"role": "system", "content": self.config.settings.PP_PROMPT},
+                                {"role": "system", "content": self.prompt},
                                 {"role": "user", "content": text},
                             ],
                             "temperature": self.config.settings.PP_TEMPERATURE,
