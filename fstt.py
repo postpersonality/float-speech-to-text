@@ -246,7 +246,7 @@ class AppSettings:
     LLM_TEMPERATURE = 1.0
     LLM_MAX_RETRIES = 2
     LLM_TIMEOUT_SEC = 60
-    SMART_TEXT_PROCESSING = True  # Включает умную обработку текста (короткие/длинные фразы)
+    SMART_TEXT_PROCESSING = False  # Включает умную обработку текста (короткие/длинные фразы)
     SMART_TEXT_SHORT_PHRASE = 3  # Максимальное количество слов для постобработки обработки коротких фраз
 
     # OpenAI settings from environment
