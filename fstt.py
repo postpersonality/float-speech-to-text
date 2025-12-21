@@ -241,11 +241,13 @@ class AppSettings:
     APP_ID = 'com.example.voice_recognition'
     COPY_METHOD = "clipboard"  # "primary", "clipboard"
     AUTO_PASTE = True
-    PP_ENABLED = True
-    PP_PROMPT_FILE = "prompt.md"
-    PP_TEMPERATURE = 1.0
-    PP_MAX_RETRIES = 2
-    PP_TIMEOUT_SEC = 60
+    LLM_ENABLED = True
+    LLM_PROMPT_FILE = "prompt.md"
+    LLM_TEMPERATURE = 1.0
+    LLM_MAX_RETRIES = 2
+    LLM_TIMEOUT_SEC = 60
+    SMART_TEXT_PROCESSING = False  # Включает умную обработку текста (короткие/длинные фразы)
+    SMART_TEXT_SHORT_PHRASE = 3  # Максимальное количество слов для постобработки обработки коротких фраз
 
     # OpenAI settings from environment
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -709,7 +711,7 @@ class PostProcessingService:
 
     def __init__(self, config: AppConfig):
         self.config = config
-        self.prompt = load_prompt_from_file(config.settings.PP_PROMPT_FILE, "You are a helpful assistant.")
+        self.prompt = load_prompt_from_file(config.settings.LLM_PROMPT_FILE, "You are a helpful assistant.")
 
     def process(self, text: str) -> str:
         """Отправляет текст в LLM и возвращает обработанный результат"""
@@ -719,9 +721,9 @@ class PostProcessingService:
 
         log(f"🧠 Отправка текста в LLM (модель: {self.config.settings.OPENAI_MODEL})...")
 
-        for attempt in range(self.config.settings.PP_MAX_RETRIES):
+        for attempt in range(self.config.settings.LLM_MAX_RETRIES):
             try:
-                with httpx.Client(timeout=self.config.settings.PP_TIMEOUT_SEC) as client:
+                with httpx.Client(timeout=self.config.settings.LLM_TIMEOUT_SEC) as client:
                     response = client.post(
                         f"{self.config.settings.OPENAI_BASE_URL.rstrip('/')}/chat/completions",
                         headers={
@@ -734,7 +736,7 @@ class PostProcessingService:
                                 {"role": "system", "content": self.prompt},
                                 {"role": "user", "content": text},
                             ],
-                            "temperature": self.config.settings.PP_TEMPERATURE,
+                            "temperature": self.config.settings.LLM_TEMPERATURE,
                         },
                     )
                     response.raise_for_status()
@@ -746,7 +748,7 @@ class PostProcessingService:
 
             except (httpx.RequestError, httpx.HTTPStatusError) as e:
                 log(f"❌ Ошибка при обращении к LLM (попытка {attempt + 1}): {e}")
-                if attempt < self.config.settings.PP_MAX_RETRIES - 1:
+                if attempt < self.config.settings.LLM_MAX_RETRIES - 1:
                     time.sleep(1)  # Пауза перед повторной попыткой
                 continue
             except (KeyError, IndexError) as e:
@@ -930,27 +932,56 @@ class ApplicationController:
 
         log(f"🎤 Распознанный текст: {text}")
 
-        # Если пост-обработка включена, запускаем её
-        if self.config.settings.PP_ENABLED:
+        if self.config.settings.LLM_ENABLED:
             self.state_machine.transition_to(AppState.POST_PROCESSING)
             AsyncTaskRunner.run_async(
                 target=lambda: self.post_processing.process(text),
-                callback=lambda processed_text: self._on_post_processing_complete(processed_text, callback)
+                callback=lambda processed_text: self._on_post_processing_complete(processed_text + " \n", callback)
             )
-        else:
-            # Иначе, обрабатываем как обычно
-            self._handle_processed_text(text)
-            self.state_machine.transition_to(AppState.IDLE)
-            callback(text)
 
-    def _on_post_processing_complete(self, processed_text: str, callback: Callable[[str], None]) -> None:
+        self._on_post_processing_complete(text, callback)
+
+    def _process_short_text(self, text: str) -> str:
+        """Обрабатывает короткий текст (1-2 слова) без LM"""
+        if not text:
+            return text
+
+        # Первая буква маленькая
+        processed = text.lower()
+
+        # Удаляем точку в конце, если есть
+        processed = processed.rstrip('.')
+
+        log(f"🔧 Обработка короткой фразы")
+        return processed
+
+    def _process_long_text(self, text: str) -> str:
+        """Обрабатывает короткий текст (1-2 слова) без LM"""
+        if not text:
+            return text
+
+        log(f"🔧 Обработка длинной фразы")
+        return text + ' \n'
+
+    def _on_post_processing_complete(self, text: str, callback: Callable[[str], None]) -> None:
         """Обработчик завершения пост-обработки"""
-        self._handle_processed_text(processed_text)
-        self.state_machine.transition_to(AppState.IDLE)
-        callback(processed_text)
 
-    def _handle_processed_text(self, text: str) -> None:
-        """Общая логика обработки текста (копирование и вставка)"""
+        if self.config.settings.SMART_TEXT_PROCESSING:
+            # Проверяем количество слов
+            word_count = len(text.split())
+            log(f"📊 Количество слов: {word_count}")
+
+            if word_count <= self.config.settings.SMART_TEXT_SHORT_PHRASE:
+                text = self._process_short_text(text)
+            else:
+                text = self._process_long_text(text)
+
+        self._copy_paste_text(text)
+        self.state_machine.transition_to(AppState.IDLE)
+        callback(text)
+
+    def _copy_paste_text(self, text: str) -> None:
+        """Копирует текст в буфер обмена и вставляет его при необходимости"""
         if self.config.settings.COPY_METHOD == "clipboard":
             self.clipboard.copy_standard(text)
         elif self.config.settings.COPY_METHOD == "primary":
@@ -1163,10 +1194,10 @@ class RecognitionWindow:
     def on_pp_clicked(self, button):
         """Обработчик нажатия кнопки пост-обработки"""
         # Переключаем состояние пост-обработки
-        self.config.settings.PP_ENABLED = not self.config.settings.PP_ENABLED
+        self.config.settings.LLM_ENABLED = not self.config.settings.LLM_ENABLED
 
         # Обновляем иконку кнопки
-        if self.config.settings.PP_ENABLED:
+        if self.config.settings.LLM_ENABLED:
             self.pp_button.set_label(self.config.ui.ICON_PP_ON)
             log("✅ Пост-обработка включена")
         else:
@@ -1236,7 +1267,7 @@ class RecognitionWindow:
 
         # Кнопка пост-обработки
         initial_pp_icon = (self.config.ui.ICON_PP_ON
-                                 if self.config.settings.PP_ENABLED
+                                 if self.config.settings.LLM_ENABLED
                                  else self.config.ui.ICON_PP_OFF)
         self.pp_button = Gtk.Button(label=initial_pp_icon)
         self.pp_button.get_style_context().add_class("autopaste-button") # Keep old class for styles
