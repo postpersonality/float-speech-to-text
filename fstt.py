@@ -4,7 +4,7 @@
 
 Архитектура приложения специально осознанно выбрана как God-file
 """
-
+from __future__ import annotations
 import sys
 import wave
 import time
@@ -52,31 +52,29 @@ class Phase(Enum):
 class State:
     """
     Неизменяемое состояние приложения.
-    
+
     Все изменения состояния проходят через reducer, который возвращает новый экземпляр State.
     Это обеспечивает предсказуемые переходы состояний и устраняет race conditions.
     """
     # Текущая фаза
     phase: Phase = Phase.IDLE
-    
+
     # Настройки (изменяемые в runtime)
     llm_enabled: bool = True
     auto_paste: bool = True
     copy_method: str = "clipboard"  # "clipboard" | "primary"
     smart_text_processing: bool = False
     smart_short_phrase_words: int = 3
-    
+
     # Данные
     recognized_text: Optional[str] = None
     processed_text: Optional[str] = None
     error: Optional[str] = None
-    
-    # Защита от конкурентности - инкрементируется при каждой новой сессии
-    # Используется для игнорирования результатов устаревших async операций
-    session_id: int = 0
-    
-    # UI-related (опционально)
+
+    # Связанное с интерфейсом
     current_monitor_name: Optional[str] = None
+    rel_x: float = 0.5  # Относительная позиция центра (0.0 - 1.0)
+    rel_y: float = 0.1  # Относительная позиция центра (0.0 - 1.0)
 
 
 # --- UI события ---
@@ -108,7 +106,6 @@ class UIToggleLLM:
 @dataclass(frozen=True)
 class ASRDone:
     """ASR (распознавание речи) завершено"""
-    session_id: int
     text: Optional[str]
     error: Optional[str] = None
 
@@ -116,7 +113,6 @@ class ASRDone:
 @dataclass(frozen=True)
 class LLMDone:
     """LLM пост-обработка завершена"""
-    session_id: int
     text: Optional[str]
     error: Optional[str] = None
 
@@ -124,7 +120,6 @@ class LLMDone:
 @dataclass(frozen=True)
 class RestartDone:
     """Перезапуск записи завершён"""
-    session_id: int
     success: bool
     error: Optional[str] = None
 
@@ -132,71 +127,80 @@ class RestartDone:
 # --- Системные события ---
 @dataclass(frozen=True)
 class MonitorChanged:
-    """Конфигурация монитора изменилась"""
+    """Конфигурация монитора изменилась или окно перемещено на новый монитор"""
     monitor_name: Optional[str]
+    rel_x: Optional[float] = None
+    rel_y: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class WindowPositionChanged:
+    """Относительная позиция окна изменилась"""
+    rel_x: float
+    rel_y: float
+    is_manual: bool = False
 
 
 # Union тип для всех действий
 Action = Union[
     UIStart, UIStop, UIRestart, UIToggleLLM,
     ASRDone, LLMDone, RestartDone,
-    MonitorChanged
+    MonitorChanged, WindowPositionChanged
 ]
 
 
 class Reducer:
     """
     Чистый reducer - обрабатывает переходы состояний без побочных эффектов.
-    
+
     Каждый обработчик:
     1. Проверяет, разрешён ли переход
     2. Возвращает новый State (или тот же state, если переход невалиден)
     3. Никогда не выполняет I/O или async операции
     """
-    
+
     @staticmethod
     def handle_ui_start(state: State, action: UIStart) -> State:
         """Пользователь хочет начать запись"""
         if state.phase != Phase.IDLE:
             return state
-        
+
         return replace(
             state,
             phase=Phase.RECORDING,
             error=None,
             recognized_text=None,
-            processed_text=None,
-            session_id=state.session_id + 1
+            processed_text=None
         )
-    
+
     @staticmethod
     def handle_ui_stop(state: State, action: UIStop) -> State:
         """Пользователь хочет остановить запись и распознать"""
         if state.phase != Phase.RECORDING:
             return state
-        
+
         return replace(state, phase=Phase.PROCESSING, error=None)
-    
+
     @staticmethod
     def handle_ui_restart(state: State, action: UIRestart) -> State:
         """Пользователь хочет перезапустить запись"""
         if state.phase != Phase.RECORDING:
             return state
-        
+
         return replace(state, phase=Phase.RESTARTING, error=None)
-    
+
     @staticmethod
     def handle_ui_toggle_llm(state: State, action: UIToggleLLM) -> State:
         """Пользователь переключил LLM обработку"""
         return replace(state, llm_enabled=not state.llm_enabled)
-    
+
     @staticmethod
     def handle_asr_done(state: State, action: ASRDone) -> State:
         """ASR завершено с текстом или ошибкой"""
-        # Игнорируем устаревшие результаты
-        if action.session_id != state.session_id:
+        # Игнорируем результаты, если мы уже не в фазе PROCESSING
+        if state.phase != Phase.PROCESSING:
             return state
-        
+
         # Обрабатываем ошибку или пустой текст
         if action.error or not action.text:
             return replace(
@@ -205,7 +209,7 @@ class Reducer:
                 error=action.error or "empty asr",
                 recognized_text=None
             )
-        
+
         # Успех - определяем следующую фазу на основе настройки LLM
         return replace(
             state,
@@ -213,14 +217,14 @@ class Reducer:
             phase=Phase.POST_PROCESSING if state.llm_enabled else Phase.IDLE,
             error=None
         )
-    
+
     @staticmethod
     def handle_llm_done(state: State, action: LLMDone) -> State:
         """LLM пост-обработка завершена"""
-        # Игнорируем устаревшие результаты
-        if action.session_id != state.session_id:
+        # Игнорируем результаты, если мы уже не в фазе POST_PROCESSING
+        if state.phase != Phase.POST_PROCESSING:
             return state
-        
+
         # Обрабатываем ошибку или пустой текст
         if action.error or not action.text:
             # Можно вернуться к recognized_text, но пока просто ошибка
@@ -230,7 +234,7 @@ class Reducer:
                 error=action.error or "empty llm",
                 processed_text=None
             )
-        
+
         # Успех
         return replace(
             state,
@@ -238,14 +242,14 @@ class Reducer:
             phase=Phase.IDLE,
             error=None
         )
-    
+
     @staticmethod
     def handle_restart_done(state: State, action: RestartDone) -> State:
         """Перезапуск записи завершён"""
-        # Игнорируем устаревшие результаты
-        if action.session_id != state.session_id:
+        # Игнорируем результаты, если мы уже не в фазе RESTARTING
+        if state.phase != Phase.RESTARTING:
             return state
-        
+
         if action.success:
             return replace(
                 state,
@@ -254,23 +258,44 @@ class Reducer:
                 recognized_text=None,
                 processed_text=None
             )
-        
+
         return replace(
             state,
             phase=Phase.IDLE,
             error=action.error or "restart failed"
         )
-    
+
     @staticmethod
     def handle_monitor_changed(state: State, action: MonitorChanged) -> State:
         """Конфигурация монитора изменилась"""
+        if action.monitor_name == state.current_monitor_name:
+            if action.rel_x is not None and action.rel_y is not None:
+                return replace(state, rel_x=action.rel_x, rel_y=action.rel_y)
+            return state
+
+        # Если при смене монитора переданы координаты - применяем их сразу
+        if action.rel_x is not None and action.rel_y is not None:
+            return replace(state,
+                           current_monitor_name=action.monitor_name,
+                           rel_x=action.rel_x,
+                           rel_y=action.rel_y)
+
         return replace(state, current_monitor_name=action.monitor_name)
-    
+
+    @staticmethod
+    def handle_window_position_changed(state: State, action: WindowPositionChanged) -> State:
+        """Позиция окна изменилась"""
+        return replace(
+            state,
+            rel_x=action.rel_x,
+            rel_y=action.rel_y
+        )
+
     @staticmethod
     def reduce(state: State, action: Action) -> State:
         """
         Главный dispatcher reducer'а.
-        
+
         Перенаправляет действия соответствующим обработчикам и возвращает новое состояние.
         """
         if isinstance(action, UIStart):
@@ -289,25 +314,27 @@ class Reducer:
             return Reducer.handle_restart_done(state, action)
         elif isinstance(action, MonitorChanged):
             return Reducer.handle_monitor_changed(state, action)
-        
+        elif isinstance(action, WindowPositionChanged):
+            return Reducer.handle_window_position_changed(state, action)
+
         return state
 
 
 class Store:
     """
     Центральное хранилище состояния с dispatch и подпиской.
-    
+
     Ответственность:
     - Хранить текущее состояние
     - Разрешать изменения состояния через dispatch(action)
     - Уведомлять подписчиков об изменениях состояния
     - Координировать эффекты
     """
-    
+
     def __init__(self, initial: State, reducer: Callable[[State, Action], State], effects: List):
         """
         Инициализация хранилища.
-        
+
         Args:
             initial: Начальное состояние
             reducer: Чистая функция (State, Action) -> State
@@ -318,20 +345,20 @@ class Store:
         self._effects = effects
         self._subs = []
         self._lock = threading.Lock()
-    
+
     @property
     def state(self) -> State:
         """Получить текущее состояние (потокобезопасное чтение)"""
         with self._lock:
             return self._state
-    
+
     def subscribe(self, fn: Callable[[State], None]) -> Callable[[], None]:
         """
         Подписаться на изменения состояния.
-        
+
         Args:
             fn: Callback функция, которая получает новое состояние
-        
+
         Returns:
             Функция отписки
         """
@@ -340,16 +367,16 @@ class Store:
         fn(self._state)
         # Возвращаем функцию отписки
         return lambda: self._subs.remove(fn) if fn in self._subs else None
-    
+
     def dispatch(self, action: Action) -> None:
         """
         Отправить действие для обновления состояния и запуска эффектов.
-        
+
         Это ЕДИНСТВЕННЫЙ способ изменить состояние. Поток выполнения:
         1. Запустить reducer для получения нового состояния (синхронно, чисто)
         2. Уведомить подписчиков в главном потоке GTK
         3. Запустить эффекты (могут отправить больше действий)
-        
+
         Args:
             action: Действие для отправки
         """
@@ -358,11 +385,11 @@ class Store:
             prev = self._state
             next_state = self._reducer(prev, action)
             self._state = next_state
-        
+
         # Шаг 2: Уведомить подписчиков в главном потоке GTK
         for fn in list(self._subs):
             GLib.idle_add(fn, next_state)
-        
+
         # Шаг 3: Запустить эффекты (они могут отправить больше действий)
         for eff in self._effects:
             eff.handle(action, prev, next_state, self.dispatch)
@@ -375,28 +402,26 @@ class Store:
 class StartRecordingEffect:
     """
     Начинает запись когда пользователь нажимает кнопку старт.
-    
+
     Срабатывает на: UIStart действие при переходе IDLE -> RECORDING
     Побочный эффект: Вызов speech.start()
     При ошибке: Отправляет ASRDone с ошибкой
     """
-    
+
     def __init__(self, speech):
         """
         Args:
             speech: Реализация SpeechProtocol
         """
         self.speech = speech
-    
+
     def handle(self, action: Action, prev: State, next: State, dispatch: Callable) -> None:
         """Обработка UIStart действия"""
         if isinstance(action, UIStart) and prev.phase == Phase.IDLE and next.phase == Phase.RECORDING:
-            log("🎙️  Запуск записи...")
             ok = self.speech.start()
             if not ok:
                 log("❌ Не удалось запустить запись")
                 dispatch(ASRDone(
-                    session_id=next.session_id,
                     text=None,
                     error="failed to start recording"
                 ))
@@ -405,12 +430,12 @@ class StartRecordingEffect:
 class ASREffect:
     """
     Выполняет распознавание речи когда пользователь останавливает запись.
-    
+
     Срабатывает на: UIStop действие при переходе RECORDING -> PROCESSING
     Побочный эффект: Запуск speech.stop_and_recognize() async
     Результат: Отправляет ASRDone с текстом или ошибкой
     """
-    
+
     def __init__(self, speech, async_runner):
         """
         Args:
@@ -419,13 +444,11 @@ class ASREffect:
         """
         self.speech = speech
         self.async_runner = async_runner
-    
+
     def handle(self, action: Action, prev: State, next: State, dispatch: Callable) -> None:
         """Обработка UIStop действия"""
         if isinstance(action, UIStop) and prev.phase == Phase.RECORDING and next.phase == Phase.PROCESSING:
-            session = next.session_id
-            log(f"🔄 Остановка записи и распознавание (session {session})...")
-            
+
             def task():
                 try:
                     text = self.speech.stop_and_recognize()
@@ -433,23 +456,23 @@ class ASREffect:
                 except Exception as e:
                     log(f"❌ Ошибка ASR: {e}")
                     return (None, str(e))
-            
+
             def done(result):
                 text, err = result
-                dispatch(ASRDone(session_id=session, text=text, error=err))
-            
+                dispatch(ASRDone(text=text, error=err))
+
             self.async_runner.run_async(task, done)
 
 
 class LLMEffect:
     """
     Выполняет LLM пост-обработку распознанного текста.
-    
+
     Срабатывает на: ASRDone действие когда llm_enabled=True
     Побочный эффект: Запуск post_processing.process() async
     Результат: Отправляет LLMDone с обработанным текстом или ошибкой
     """
-    
+
     def __init__(self, post_processing, async_runner):
         """
         Args:
@@ -458,24 +481,20 @@ class LLMEffect:
         """
         self.pp = post_processing
         self.async_runner = async_runner
-    
+
     def handle(self, action: Action, prev: State, next: State, dispatch: Callable) -> None:
         """Обработка ASRDone действия"""
-        # Срабатываем только на ASRDone для текущей сессии
+        # Срабатываем только на ASRDone
         if not isinstance(action, ASRDone):
             return
-        if action.session_id != next.session_id:
-            return
-        
+
         # Только если LLM включён и есть текст
         if not next.llm_enabled:
             return
         if not action.text:
             return
-        
-        session = next.session_id
-        log(f"🤖 Запуск LLM обработки (session {session})...")
-        
+
+
         def task():
             try:
                 processed = self.pp.process(action.text)
@@ -483,31 +502,31 @@ class LLMEffect:
             except Exception as e:
                 log(f"❌ Ошибка LLM: {e}")
                 return (None, str(e))
-        
+
         def done(result):
             text, err = result
-            dispatch(LLMDone(session_id=session, text=text, error=err))
-        
+            dispatch(LLMDone(text=text, error=err))
+
         self.async_runner.run_async(task, done)
 
 
 class FinalizeEffect:
     """
     Финализирует обработку текста копированием и вставкой.
-    
+
     Это КРИТИЧЕСКИЙ эффект, который исправляет баг двойного copy/paste.
     Он обеспечивает ровно ОДНУ финализацию на сессию.
-    
+
     Срабатывает на:
     1. ASRDone когда llm_enabled=False (копирует распознанный текст)
     2. LLMDone (копирует обработанный текст, или fallback на распознанный)
-    
-    Побочные эффекты: 
+
+    Побочные эффекты:
     - Применяет умную обработку текста
     - Копирует в clipboard/primary
     - Автовставка если включена
     """
-    
+
     def __init__(self, clipboard, paste, glib_module, config):
         """
         Args:
@@ -520,12 +539,12 @@ class FinalizeEffect:
         self.paste = paste
         self.GLib = glib_module
         self.config = config
-    
+
     def smart_process(self, state: State, text: str) -> str:
         """Применить умную обработку текста если включена"""
         if not state.smart_text_processing:
             return text
-        
+
         words = len(text.split())
         if words <= state.smart_short_phrase_words:
             # Короткая фраза: lowercase, убрать точку в конце
@@ -533,7 +552,7 @@ class FinalizeEffect:
         else:
             # Длинная фраза: добавить перевод строки
             return text + " \n"
-    
+
     def copy_paste(self, state: State, text: str) -> None:
         """Копировать текст и опционально вставить"""
         # Копировать в соответствующий буфер обмена
@@ -541,43 +560,41 @@ class FinalizeEffect:
             self.clipboard.copy_standard(text)
         else:
             self.clipboard.copy_primary(text)
-        
-        log(f"📋 Текст скопирован ({state.copy_method}): {text[:50]}...")
-        
+
         # Автовставка если включена
         if state.auto_paste:
             delay_ms = self.config.settings.PASTE_DELAY_MS
             self.GLib.timeout_add(delay_ms, lambda: (self.paste.paste(), False)[1])
             log(f"⌨️  Авто-вставка запланирована ({delay_ms}ms)")
-    
+
     def handle(self, action: Action, prev: State, next: State, dispatch: Callable) -> None:
         """Обработка триггеров финализации"""
-        
+
         # Случай 1: ASRDone + LLM выключен => финализировать распознанным текстом
-        if isinstance(action, ASRDone) and action.session_id == next.session_id and not next.llm_enabled:
+        if isinstance(action, ASRDone) and not next.llm_enabled:
             if action.text and next.phase == Phase.IDLE:
-                log(f"✅ Финализация после ASR (session {action.session_id}, без LLM)")
+                log("✅ Финализация после ASR (без LLM)")
                 text = self.smart_process(next, action.text)
                 self.copy_paste(next, text)
             return
-        
+
         # Случай 2: LLMDone => финализировать обработанным текстом (или fallback)
-        if isinstance(action, LLMDone) and action.session_id == next.session_id:
+        if isinstance(action, LLMDone):
             if next.phase == Phase.IDLE:
                 # Использовать обработанный текст если доступен, иначе fallback на распознанный
                 base = action.text or next.recognized_text
                 if base:
-                    log(f"✅ Финализация после LLM (session {action.session_id})")
+                    log("✅ Финализация после LLM")
                     text = self.smart_process(next, base)
                     self.copy_paste(next, text)
                 else:
-                    log(f"⚠️  Нет текста для финализации (session {action.session_id})")
+                    log("⚠️  Нет текста для финализации")
 
 
 class RestartEffect:
     """
     Перезапускает запись остановкой, ожиданием и повторным запуском.
-    
+
     Срабатывает на: UIRestart действие при переходе RECORDING -> RESTARTING
     Побочные эффекты:
     1. Остановка записи (без распознавания)
@@ -585,7 +602,7 @@ class RestartEffect:
     3. Повторный запуск записи
     Результат: Отправляет RestartDone с успехом/ошибкой
     """
-    
+
     def __init__(self, speech, async_runner, restart_delay_sec: float):
         """
         Args:
@@ -596,44 +613,43 @@ class RestartEffect:
         self.speech = speech
         self.async_runner = async_runner
         self.delay = restart_delay_sec
-    
+
     def handle(self, action: Action, prev: State, next: State, dispatch: Callable) -> None:
         """Обработка UIRestart действия"""
         if isinstance(action, UIRestart) and prev.phase == Phase.RECORDING and next.phase == Phase.RESTARTING:
-            session = next.session_id
-            log(f"🔄 Перезапуск записи (session {session})...")
-            
+            log("🔄 Перезапуск записи...")
+
             def task():
                 try:
                     # Остановка без распознавания
                     self.speech.stop()
                     log(f"⏸️  Запись остановлена, ожидание {self.delay}s...")
-                    
+
                     # Задержка
                     time.sleep(self.delay)
-                    
+
                     # Запуск снова
                     ok = self.speech.start()
                     return (ok, None)
                 except Exception as e:
                     log(f"❌ Ошибка перезапуска: {e}")
                     return (False, str(e))
-            
+
             def done(result):
                 ok, err = result
-                dispatch(RestartDone(session_id=session, success=ok, error=err))
-            
+                dispatch(RestartDone(success=ok, error=err))
+
             self.async_runner.run_async(task, done)
 
 
 class SettingsPersistenceEffect:
     """
     Сохраняет настройки пользователя в JSON файл при их изменении.
-    
+
     Срабатывает на: UIToggleLLM и другие actions, меняющие настройки
     Побочный эффект: Запись settings.json в ~/.config/float-speech-to-text/
     """
-    
+
     def __init__(self, settings_file: str):
         """
         Args:
@@ -642,7 +658,7 @@ class SettingsPersistenceEffect:
         self.settings_file = settings_file
         # Создаём директорию если не существует
         os.makedirs(os.path.dirname(settings_file), exist_ok=True)
-    
+
     def handle(self, action: Action, prev: State, next: State, dispatch: Callable) -> None:
         """Обработка изменений настроек"""
         # Проверяем, изменились ли настройки
@@ -653,10 +669,10 @@ class SettingsPersistenceEffect:
             prev.smart_text_processing != next.smart_text_processing or
             prev.smart_short_phrase_words != next.smart_short_phrase_words
         )
-        
+
         if settings_changed:
             self._save_settings(next)
-    
+
     def _save_settings(self, state: State) -> None:
         """Сохраняет настройки в JSON файл"""
         try:
@@ -667,14 +683,14 @@ class SettingsPersistenceEffect:
                 "smart_text_processing": state.smart_text_processing,
                 "smart_short_phrase_words": state.smart_short_phrase_words
             }
-            
+
             with open(self.settings_file, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, indent=2, ensure_ascii=False)
-            
+
             log(f"💾 Настройки сохранены в {self.settings_file}")
         except Exception as e:
             log(f"❌ Ошибка сохранения настроек: {e}")
-    
+
     @staticmethod
     def load_settings(settings_file: str) -> dict:
         """Загружает настройки из JSON файла"""
@@ -686,12 +702,46 @@ class SettingsPersistenceEffect:
                 return settings
         except Exception as e:
             log(f"❌ Ошибка загрузки настроек: {e}")
-        
+
         return {}
 
 
+class WindowPersistenceEffect:
+    """
+    Управляет загрузкой и сохранением позиции окна через Redux.
+
+    Срабатывает на:
+    1. MonitorChanged: Загружает позицию для нового монитора и отправляет WindowPositionChanged
+    2. WindowPositionChanged: Сохраняет новую позицию для текущего монитора
+    """
+
+    def __init__(self, monitor_manager, window_persistence, config):
+        """
+        Args:
+            monitor_manager: MonitorManager для расчётов позиций
+            window_persistence: WindowPositionPersistence для I/O
+            config: AppConfig
+        """
+        self.mm = monitor_manager
+        self.wp = window_persistence
+        self.config = config
+
+    def handle(self, action: Action, prev: State, next: State, dispatch: Callable) -> None:
+        """Обработка событий монитора и позиции"""
+
+        # Сохраняем позицию только если она была изменена вручную (перетаскивание)
+        if isinstance(action, WindowPositionChanged) and action.is_manual:
+            if next.current_monitor_name:
+                self.wp.save_position(
+                    next.current_monitor_name,
+                    action.rel_x,
+                    action.rel_y
+                )
+                self.wp.save_last_monitor(next.current_monitor_name)
+
+
 # ============================================================================
-# UTILITY FUNCTIONS
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ============================================================================
 
 def log(message):
@@ -717,10 +767,15 @@ def load_prompt_from_file(file_path: str, default_prompt: str) -> str:
 class MonitorManager:
     """Управление состоянием мониторов и относительным позиционированием окна"""
 
-    def __init__(self):
+    def __init__(self, config: Optional[AppConfig] = None):
+        self.config = config
         self.display = None
-        self.last_monitor_name = None
         self.monitors_available = True
+        self.on_stable_change = None
+
+        # Состояние ретраев для "не готовых" мониторов
+        self.retry_id = None
+        self.retry_count = 0
 
     def get_monitor_at_cursor(self) -> Optional[Gdk.Monitor]:
         """Возвращает монитор, на котором находится курсор мыши, или первый доступный"""
@@ -843,7 +898,6 @@ class MonitorManager:
             log(f"⚠️  Ошибка получения идентификатора монитора: {e}")
             return None
 
-
     def get_monitor_by_name(self, monitor_name: str) -> Optional[Gdk.Monitor]:
         """Находит монитор по его имени/модели"""
         if not self.display:
@@ -955,20 +1009,98 @@ class MonitorManager:
         margin_right = max(0, min(monitor_width - window_width, margin_right))
         margin_top = max(0, min(monitor_height - window_height, margin_top))
 
-        log(f"🧮 Абсолютная позиция: margin_right={int(margin_right)}, margin_top={int(margin_top)}")
+
 
         return (int(margin_right), int(margin_top))
 
-    def start_monitoring(self, display: Gdk.Display, on_monitor_changed: Callable):
-        """Запускает мониторинг изменений конфигурации дисплеев"""
+    def start_monitoring(self, display: Gdk.Display, on_stable_change: Callable):
+        """
+        Запускает мониторинг изменений дисплеев.
+        Колбэк on_stable_change будет вызван только когда монитор определен и готов.
+        """
         self.display = display
-        pass
+        self.on_stable_change = on_stable_change
 
         # Подписываемся на изменения конфигурации мониторов
-        display.connect("monitor-added", lambda d, m: on_monitor_changed(d, m))
-        display.connect("monitor-removed", lambda d, m: on_monitor_changed(d, m))
+        display.connect("monitor-added", self._handle_monitor_event)
+        display.connect("monitor-removed", self._handle_monitor_event)
 
         log("👀 Мониторинг дисплеев запущен")
+
+    def _handle_monitor_event(self, display, monitor=None):
+        """Внутренний обработчик событий монитора с логикой ретраев"""
+        log("📺 Обнаружено изменение конфигурации мониторов (MonitorManager)")
+
+        # Отменяем текущий ретрай если есть
+        if self.retry_id:
+            GLib.source_remove(self.retry_id)
+            self.retry_id = None
+
+        if not self.check_monitors_available():
+            log("⚠️  Все мониторы отключены")
+            if self.on_stable_change:
+                self.on_stable_change(None)
+            self.retry_count = 0
+            return
+
+        # Пытаемся найти активный монитор
+        active_monitor = self.find_active_monitor()
+
+        if active_monitor:
+            monitor_name = self.get_monitor_identifier(active_monitor)
+            if monitor_name:
+                log(f"✅ Монитор готов: {monitor_name}")
+                self.retry_count = 0
+                if self.on_stable_change:
+                    self.on_stable_change(active_monitor)
+                return
+
+        # Если мониторы есть, но не готовы - планируем ретрай
+        self._schedule_retry(display, monitor)
+
+    def _schedule_retry(self, display, monitor):
+        """Планирует повторную проверку мониторов"""
+        if self.retry_count < 15:  # 15 * 200ms = 3 сек
+            self.retry_count += 1
+            log(f"⏳ Мониторы не готовы. Повтор через 200мс (попытка {self.retry_count})")
+            self.retry_id = GLib.timeout_add(
+                200,
+                lambda: (self._handle_monitor_event(display, monitor), False)[1]
+            )
+        else:
+            log("⚠️  Не удалось найти готовый монитор после всех попыток")
+            self.retry_count = 0
+            # Если так и не нашли ничего за 3 секунды, уведомляем о потере
+            if self.on_stable_change:
+                self.on_stable_change(None)
+
+    def find_active_monitor(self) -> Optional[Gdk.Monitor]:
+        """
+        Стратегия поиска лучшего монитора для размещения окна:
+        1. Пробуем монитор с курсором
+        2. Пробуем последний использованный монитор (если config доступен)
+        3. Берем первый попавшийся
+        """
+        try:
+            # 1. По курсору
+            monitor = self.get_monitor_at_cursor()
+            if monitor:
+                name = self.get_monitor_identifier(monitor)
+                if name: return monitor
+
+            # 2. По конфигу (последний известный)
+            if self.config:
+                last_name = self.config.window.get_last_monitor()
+                if last_name:
+                    monitor = self.get_monitor_by_name(last_name)
+                    if monitor and self.get_monitor_identifier(monitor):
+                        return monitor
+
+            # 3. Fallback: Первый попавшийся
+            return self.get_first_monitor()
+        except Exception as e:
+            log(f"❌ Ошибка при поиске монитора: {e}")
+            return None
 
     def check_monitors_available(self) -> bool:
         """Проверяет наличие активных мониторов"""
@@ -1102,7 +1234,8 @@ button {
     border-radius: 5px;
     border: none;
     font-size: 20px;
-    padding: 5px 10px;
+    padding: 5px 0px;
+    min-width: 35px;
 }
 button:hover {
     background-color: rgba(60, 60, 60, 0.3);
@@ -1133,7 +1266,7 @@ button:disabled {
 class AppSettings:
     """Настройки поведения приложения"""
     APP_ID = 'com.example.voice_recognition'
-    COPY_METHOD = os.environ.get("FSTT_CLIPBOARD_COPY_METHOD", "clipboard")  # варианты: "primary", "clipboard"
+    COPY_METHOD = os.environ.get("FSTT_CLIPBOARD_COPY_METHOD", "clipboard")  # Варианты: "primary", "clipboard"
     AUTO_PASTE = get_env_bool("FSTT_CLIPBOARD_PASTE_ENABLED", True)
     LLM_ENABLED = get_env_bool("FSTT_LLM_ENABLED", True)
     LLM_PROMPT_FILE = os.environ.get("FSTT_LLM_PROMPT_FILE", "prompt.md")
@@ -1141,7 +1274,7 @@ class AppSettings:
     LLM_MAX_RETRIES = get_env_int("FSTT_LLM_MAX_RETRIES", 2)
     LLM_TIMEOUT_SEC = get_env_int("FSTT_LLM_TIMEOUT_SEC", 60)
     SMART_TEXT_PROCESSING = get_env_bool("FSTT_POSTPROCESSING_ENABLED", False)  # Включает умную обработку текста (короткие/длинные фразы)
-    SMART_TEXT_SHORT_PHRASE = get_env_int("FSTT_POSTPROCESSING_WORD_TRESHOLD", 3)  # Максимальное количество слов для постобработки обработки коротких фраз
+    SMART_TEXT_SHORT_PHRASE = get_env_int("FSTT_POSTPROCESSING_WORD_THRESHOLD", 3)  # Максимальное количество слов для постобработки обработки коротких фраз
 
     # Настройки OpenAI из переменных окружения
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -1425,7 +1558,7 @@ class ClipboardService:
         if shutil.which('xclip'):
             return self._copy_primary_xclip(text)
 
-        # Fallback на GTK API
+        # Резервный вариант: GTK Clipboard API
         log("⚠️  Системные команды не найдены, пробую GTK Clipboard API...")
         log("💡 Установите wl-clipboard для Wayland: sudo pacman -S wl-clipboard")
         log("💡 Или установите xsel для X11: sudo pacman -S xsel")
@@ -1680,6 +1813,8 @@ class SpeechService:
 
         try:
             text = self.model.recognize(self.config.audio.WAV_FILE)
+            if text:
+                log(f"📝 Распознано: {text}")
             return text
         except Exception as e:
             log(f"❌ Ошибка распознавания: {e}")
@@ -1713,8 +1848,8 @@ class PostProcessingService:
                         json={
                             "model": self.config.settings.OPENAI_MODEL,
                             "messages": [
-                                {"role": "system", "content": self.prompt},
-                                {"role": "user", "content": text},
+                                {"role": "user", "content": self.prompt},
+                                {"role": "user", "content": f"<user_input>{text}</user_input>"},
                             ],
                             "temperature": self.config.settings.LLM_TEMPERATURE,
                         },
@@ -1723,7 +1858,7 @@ class PostProcessingService:
                     result = response.json()
 
                     processed_text = result["choices"][0]["message"]["content"].strip()
-                    log(f"✅ LLM вернул обработанный текст: {processed_text}")
+                    log(f"✅ LLM ({self.config.settings.OPENAI_MODEL}) обработал: {processed_text}")
                     return processed_text
 
             except (httpx.RequestError, httpx.HTTPStatusError) as e:
@@ -1738,14 +1873,12 @@ class PostProcessingService:
                 log(f"❌ Неизвестная ошибка при пост-обработке: {e}")
                 break  # Не повторяем при других ошибках
 
-        # Fallback - возвращаем исходный текст
+        # Резервный вариант: возвращаем исходный текст
         log("⚠️  Не удалось получить ответ от LLM после нескольких попыток.")
         return text
 
 
-# ============================================================================
-# APPLICATION CONTROLLER (БИЗНЕС-ЛОГИКА)
-# ============================================================================
+
 
 class AsyncTaskRunner:
     """Управляет выполнением асинхронных задач в фоновых потоках"""
@@ -1782,7 +1915,7 @@ class AsyncTaskRunner:
 
 
 # ============================================================================
-# UI
+# ИНТЕРФЕЙС
 # ============================================================================
 
 class RecognitionWindow:
@@ -1800,7 +1933,8 @@ class RecognitionWindow:
     def __init__(
         self,
         config: AppConfig,
-        store: Store
+        store: Store,
+        monitor_manager: MonitorManager
     ):
         """
         Инициализирует окно с внедрёнными зависимостями
@@ -1808,9 +1942,11 @@ class RecognitionWindow:
         Args:
             config: Конфигурация приложения
             store: Redux store для управления состоянием
+            monitor_manager: Менеджер мониторов
         """
         self.config = config
         self.store = store
+        self.monitor_manager = monitor_manager
 
         self.window = None
         self.button = None
@@ -1818,19 +1954,15 @@ class RecognitionWindow:
         self.pp_button = None
         self.app = None
 
-        # Monitor management
-        self.monitor_manager = MonitorManager()
-        self.current_monitor_name = None
-        self.monitor_retry_count = 0
-        self.monitor_retry_id = None
-
-        # Для drag-and-drop
+        # Для drag-and-drop (эфемеpное состояние перетаскивания)
         self.drag_start_x = 0
         self.drag_start_y = 0
         self.is_dragging = False
         self.was_moved = False
-        self.window_x = self.config.ui.DEFAULT_WINDOW_X
-        self.window_y = self.config.ui.DEFAULT_WINDOW_Y
+
+        # Текущие отступы (кеш для отрисовки и плавного перетаскивания)
+        self.current_margin_x = 20
+        self.current_margin_y = 50
 
         # Подписываемся на изменения состояния
         self.store.subscribe(self._render_state)
@@ -1853,24 +1985,32 @@ class RecognitionWindow:
             factory = ServiceFactory()
 
         speech, clipboard, paste, post_processing = factory.create_all_services(config)
-        
+
+        # Создаём один экземпляр MonitorManager для всех нужд
+        monitor_manager = MonitorManager(config=config)
+
         # Путь к файлу настроек
         settings_file = os.path.expanduser("~/.config/float-speech-to-text/settings.json")
-        
+
         # Загружаем сохранённые настройки
         saved_settings = SettingsPersistenceEffect.load_settings(settings_file)
-        
-        # Create effects (включаем SettingsPersistenceEffect)
+
+        # Создаём эффекты (включаем SettingsPersistenceEffect и WindowPersistenceEffect)
         effects = [
             StartRecordingEffect(speech),
             ASREffect(speech, AsyncTaskRunner),
             LLMEffect(post_processing, AsyncTaskRunner),
             FinalizeEffect(clipboard, paste, GLib, config),
             RestartEffect(speech, AsyncTaskRunner, AppSettings.RESTART_DELAY_SEC),
-            SettingsPersistenceEffect(settings_file)
+            SettingsPersistenceEffect(settings_file),
+            WindowPersistenceEffect(
+                monitor_manager=monitor_manager,
+                window_persistence=WindowPositionPersistence,
+                config=config
+            )
         ]
-        
-        # Initialize state from config, перезаписываем сохранёнными настройками
+
+        # Инициализируем состояние из конфигурации
         initial_state = State(
             llm_enabled=saved_settings.get('llm_enabled', config.settings.LLM_ENABLED),
             auto_paste=saved_settings.get('auto_paste', config.settings.AUTO_PASTE),
@@ -1878,11 +2018,11 @@ class RecognitionWindow:
             smart_text_processing=saved_settings.get('smart_text_processing', config.settings.SMART_TEXT_PROCESSING),
             smart_short_phrase_words=saved_settings.get('smart_short_phrase_words', config.settings.SMART_TEXT_SHORT_PHRASE)
         )
-        
-        # Create store
+
+        # Создаём хранилище
         store = Store(initial_state, Reducer.reduce, effects)
-        
-        return cls(config, store)
+
+        return cls(config, store, monitor_manager=monitor_manager)
 
     def _update_record_button(self, label: str, is_sensitive: bool = True):
         """
@@ -1923,28 +2063,45 @@ class RecognitionWindow:
             style_context.add_class("close-button")
 
     def _render_state(self, state: State):
-        """Redux subscriber - updates UI based on current state"""
-        # Update record button based on phase
+        """Redux subscriber - обновляет UI на основе текущего состояния"""
+        # 1. Обновляем состояние кнопок на основе фазы
         if state.phase == Phase.IDLE:
             self._update_record_button(self.config.ui.ICON_RECORD, is_sensitive=True)
             self._update_restart_button(self.config.ui.ICON_CLOSE, is_restart=False, is_sensitive=True)
-        
+
         elif state.phase == Phase.RECORDING:
             self._update_record_button(self.config.ui.ICON_STOP, is_sensitive=True)
             self._update_restart_button(self.config.ui.ICON_RESTART, is_restart=True, is_sensitive=True)
-        
+
         elif state.phase in (Phase.PROCESSING, Phase.POST_PROCESSING):
             self._update_record_button(self.config.ui.ICON_PROCESSING, is_sensitive=False)
             self._update_restart_button(self.config.ui.ICON_CLOSE, is_restart=False, is_sensitive=False)
-        
+
         elif state.phase == Phase.RESTARTING:
             self._update_record_button(self.config.ui.ICON_PROCESSING, is_sensitive=False)
             self._update_restart_button(self.config.ui.ICON_RESTART, is_restart=True, is_sensitive=False)
-        
-        # Update PP button based on llm_enabled
+
+        # 2. Обновляем кнопку PP button
         if self.pp_button:
             icon = self.config.ui.ICON_PP_ON if state.llm_enabled else self.config.ui.ICON_PP_OFF
             self.pp_button.set_label(icon)
+
+        # 3. Обновляем позицию на основе относительных координат из состояния
+        if not self.is_dragging and state.current_monitor_name and self.window:
+            monitor = self.monitor_manager.get_monitor_by_name(state.current_monitor_name)
+            if monitor:
+                window_width, window_height = self._get_window_size()
+                margin_right, margin_top = self.monitor_manager.calculate_absolute_position(
+                    state.rel_x, state.rel_y, window_width, window_height, monitor
+                )
+
+                # Применяем если изменилось
+                if margin_right != self.current_margin_x or margin_top != self.current_margin_y:
+                    self.current_margin_x = margin_right
+                    self.current_margin_y = margin_top
+                    GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.TOP, int(margin_top))
+                    GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.RIGHT, int(margin_right))
+                    log(f"📐 Render: Окно позиционировано ({margin_right}, {margin_top}) на {state.current_monitor_name}")
 
 
     def on_button_press(self, _widget, event):
@@ -1961,20 +2118,22 @@ class RecognitionWindow:
             self.is_dragging = False
             # Сохраняем позицию только если окно действительно перемещалось
             if self.was_moved:
-                # Определяем текущий монитор
                 monitor = self.monitor_manager.get_monitor_at_cursor()
                 if monitor:
                     monitor_name = self.monitor_manager.get_monitor_identifier(monitor)
-                    # Получаем размеры окна
-                    window_width = self.window.get_allocated_width()
-                    window_height = self.window.get_allocated_height()
+                    window_width, window_height = self._get_window_size()
+
                     # Вычисляем относительную позицию центра окна
                     rel_center_x, rel_center_y = self.monitor_manager.calculate_relative_position(
-                        self.window_x, self.window_y, window_width, window_height, monitor
+                        self.current_margin_x, self.current_margin_y, window_width, window_height, monitor
                     )
-                    # Сохраняем относительную позицию центра для этого монитора
-                    self.config.window.save_position(monitor_name, rel_center_x, rel_center_y)
-                    self.current_monitor_name = monitor_name
+
+                    # Диспатчим изменение позиции в Redux -> сохранится через эффект (флаг is_manual=True)
+                    self.store.dispatch(WindowPositionChanged(rel_x=rel_center_x, rel_y=rel_center_y, is_manual=True))
+
+                    # Если монитор изменился (например, перетащили на другой экран), диспатчим это тоже
+                    if monitor_name != self.store.state.current_monitor_name:
+                         self.store.dispatch(MonitorChanged(monitor_name=monitor_name))
             self.was_moved = False
 
     def on_motion_notify(self, _widget, event):
@@ -1984,17 +2143,15 @@ class RecognitionWindow:
             dx = event.x_root - self.drag_start_x
             dy = event.y_root - self.drag_start_y
 
-            # Обновляем позицию
+            # Обновляем позицию (кеш)
             # Инвертируем dx, так как окно привязано к правому краю
-            self.window_x -= dx
-            self.window_y += dy
-
-            # Устанавливаем флаг, что окно было перемещено
+            self.current_margin_x -= dx
+            self.current_margin_y += dy
             self.was_moved = True
 
-            # Обновляем позицию окна через margins
-            GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.TOP, int(self.window_y))
-            GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.RIGHT, int(self.window_x))
+            # Плавное обновление через margins (без Redux для производительности драга)
+            GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.TOP, int(self.current_margin_y))
+            GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.RIGHT, int(self.current_margin_x))
 
             # Обновляем начальную позицию для следующего движения
             self.drag_start_x = event.x_root
@@ -2016,8 +2173,7 @@ class RecognitionWindow:
         """Обработчик нажатия кнопки пост-обработки"""
         # Переключаем состояние пост-обработки через action
         self.store.dispatch(UIToggleLLM())
-        
-        # Log для обратной информации
+
         if self.store.state.llm_enabled:
             log("✅ Пост-обработка включена")
         else:
@@ -2051,8 +2207,8 @@ class RecognitionWindow:
         GtkLayerShell.set_anchor(self.window, GtkLayerShell.Edge.RIGHT, True)
 
         # Устанавливаем отступы из сохранённой позиции
-        GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.TOP, int(self.window_y))
-        GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.RIGHT, int(self.window_x))
+        GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.TOP, int(self.current_margin_y))
+        GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.RIGHT, int(self.current_margin_x))
 
         # Устанавливаем слой поверх всего
         GtkLayerShell.set_layer(self.window, GtkLayerShell.Layer.OVERLAY)
@@ -2089,7 +2245,7 @@ class RecognitionWindow:
                                  if self.config.settings.LLM_ENABLED
                                  else self.config.ui.ICON_PP_OFF)
         self.pp_button = Gtk.Button(label=initial_pp_icon)
-        self.pp_button.get_style_context().add_class("autopaste-button") # Keep old class for styles
+        self.pp_button.get_style_context().add_class("autopaste-button") # Сохраняем старый класс для стилей
         self.pp_button.connect("clicked", self.on_pp_clicked)
 
         # Сохраняем ссылку на app для возможности закрытия приложения
@@ -2124,7 +2280,7 @@ class RecognitionWindow:
             width = pref_size.width
             height = pref_size.height
             log(f"📐 Окно не отрисовано, используем preferred size: {width}x{height}")
-        
+
         return width, height
 
     def on_activate(self, app):
@@ -2141,7 +2297,7 @@ class RecognitionWindow:
         # CSS стили
         self._setup_css_styles(screen)
 
-        # Drag-and-drop
+        # Перетаскивание (Drag-and-drop)
         self._setup_drag_and_drop()
 
         # Создаем UI элементы
@@ -2150,201 +2306,35 @@ class RecognitionWindow:
         self.window.add(box)
         self.window.show_all()
 
-        # После show_all() окно имеет размеры, теперь можем позиционировать
-        # Получаем монитор с курсором мыши
-        monitor = self.monitor_manager.get_monitor_at_cursor()
-
-        if not monitor:
-            log("⚠️  Не удалось получить монитор, все мониторы выключены?")
-            if not self.monitor_manager.check_monitors_available():
-                log("⚠️  Нет доступных мониторов, скрываем окно")
-                self.window.hide()
-            return
-
-        # Получаем имя монитора и загружаем позицию для него
-        self.current_monitor_name = self.monitor_manager.get_monitor_identifier(monitor)
-        log(f"📺 Текущий монитор: {self.current_monitor_name}")
-
-        # Загружаем относительную позицию центра для этого монитора
-        rel_center_x, rel_center_y = self.config.window.load_position(self.current_monitor_name)
-
-        # Получаем размеры окна
-        window_width, window_height = self._get_window_size()
-
-        # Вычисляем абсолютную позицию (margins) из относительной
-        margin_right, margin_top = self.monitor_manager.calculate_absolute_position(
-            rel_center_x, rel_center_y, window_width, window_height, monitor
-        )
-
-        # Применяем позицию
-        self.window_x = margin_right
-        self.window_y = margin_top
-        GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.TOP, int(margin_top))
-        GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.RIGHT, int(margin_right))
-
         # Запускаем мониторинг изменений дисплеев
         display = self.window.get_display()
-        self.monitor_manager.start_monitoring(display, self._on_monitor_changed)
+        self.monitor_manager.start_monitoring(display, self._handle_monitor_state_change)
 
-        log(f"✅ Окно позиционировано на мониторе {self.current_monitor_name}")
+        # Запускаем первичную проверку монитора (с использованием внутренней логики ретраев)
+        # Это гарантирует, что если монитор не готов при запуске, он будет найден через ретраи.
+        self.monitor_manager._handle_monitor_event(display)
 
-    def _on_monitor_changed(self, display, monitor=None):
-        """Обработчик изменения конфигурации мониторов"""
-        log("📺 Обнаружено изменение конфигурации мониторов")
+        log(f"✅ Окно инициализировано")
 
-        # Сбрасываем предыдущий таймер если был
-        if self.monitor_retry_id:
-            GLib.source_remove(self.monitor_retry_id)
-            self.monitor_retry_id = None
-
-        # Проверяем, есть ли активные мониторы
-        if not self.monitor_manager.check_monitors_available():
-            log("⚠️  Все мониторы отключены, приложение ждёт подключения")
-            self.window.hide()
-            self.monitor_retry_count = 0
-            return
-
-        # Проверяем, доступен ли текущий монитор (и готов ли он)
-        if self.current_monitor_name:
-            current_monitor = self.monitor_manager.get_monitor_by_name(self.current_monitor_name)
-
-            if current_monitor is None:
-                # Текущий монитор отключен или не готов
-                log(f"📺 Монитор {self.current_monitor_name} отключен или не готов")
-
-                # Сохраняем имя при отключении
-                self.config.window.save_last_monitor(self.current_monitor_name)
-
-                # Пробуем найти новый монитор
-                new_monitor = self._find_available_monitor()
-                if new_monitor:
-                    self.monitor_retry_count = 0
-                    self._move_to_monitor(new_monitor)
-                else:
-                    # Мониторы есть, но не готовы?
-                    self._schedule_monitor_retry(display, monitor)
-            else:
-                # Текущий монитор все еще на месте и готов (или восстановился)
-                log(f"✅ Текущий монитор {self.current_monitor_name} активен")
-
-                # Если окно скрыто, обязательно восстанавливаем его
-                if not self.window.get_visible():
-                    log("📺 Окно было скрыто, восстанавливаем и показываем")
-                    # Перемещаем (обновляем позицию), так как размеры могли измениться
-                    self._move_to_monitor(current_monitor)
-                    self.window.show_all()
-                    self.monitor_retry_count = 0
-                else:
-                    # Даже если окно видно, стоит убедиться что оно на правильном месте
-                    # (например, разрешение поменялось при том же мониторе)
-                     # Но делаем это аккуратно, чтобы не спамить
-                    pass
-        else:
-            # Окно было скрыто или монитор не выбран
-            log("📺 Поиск монитора для восстановления окна")
-
-            # Пробуем восстановить на последний известный монитор
-            last_monitor_name = self.config.window.get_last_monitor()
-            new_monitor = None
-
-            if last_monitor_name:
-                new_monitor = self.monitor_manager.get_monitor_by_name(last_monitor_name)
-                if new_monitor:
-                    log(f"📺 Восстанавливаем на последний монитор: {last_monitor_name}")
-
-            # Если не нашли последний, берем любой доступный
-            if not new_monitor:
-                new_monitor = self._find_available_monitor()
-
-            if new_monitor:
-                self.monitor_retry_count = 0
-                self._move_to_monitor(new_monitor)
-            else:
-                self._schedule_monitor_retry(display, monitor)
-
-    def _schedule_monitor_retry(self, display, monitor):
-        """Планирует повторную проверку мониторов"""
-        if self.monitor_retry_count < 15:  # 15 * 200ms = 3 сек
-            self.monitor_retry_count += 1
-            log(f"⏳ Мониторы обнаружены, но не готовы. Повтор через 200мс (попытка {self.monitor_retry_count})")
-            self.monitor_retry_id = GLib.timeout_add(
-                200,
-                lambda: self._on_monitor_changed(display, monitor)
-            )
-        else:
-            log("⚠️  Не удалось найти готовый монитор после всех попыток")
-            self.monitor_retry_count = 0
-
-    def _find_available_monitor(self) -> Optional[Gdk.Monitor]:
-        """Находит доступный монитор (сначала по курсору, потом первый)"""
-        try:
-            log("🔍 _find_available_monitor: поиск доступного монитора")
-
-            # Пробуем получить монитор с курсором
-            monitor = self.monitor_manager.get_monitor_at_cursor()
-
-            # Используем идентификатор для проверки валидности
-            if monitor:
-                monitor_id = self.monitor_manager.get_monitor_identifier(monitor)
-                if monitor_id and monitor_id != "Unknown":
-                    log(f"🔍 Монитор найден по курсору: {monitor_id}")
-                    return monitor
-                else:
-                    log(f"⚠️  Монитор по курсору имеет невалидный ID: {monitor_id}")
-
-            # Fallback на первый доступный
-            log("🔍 Пробуем get_first_monitor как fallback")
-            monitor = self.monitor_manager.get_first_monitor()
-
-            if monitor:
-                monitor_id = self.monitor_manager.get_monitor_identifier(monitor)
-                log(f"🔍 get_first_monitor вернул: {monitor_id}")
-
-                if monitor_id:
-                    return monitor
-                else:
-                    log("⚠️  Монитор найден, но не готов (ID is None)")
-
-            return None
-        except Exception as e:
-            log(f"❌ Ошибка в _find_available_monitor: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-
-    def _move_to_monitor(self, monitor: Gdk.Monitor):
-        """Перемещает окно на указанный монитор"""
+    def _handle_monitor_state_change(self, monitor: Optional[Gdk.Monitor]):
+        """Обработчик стабильного изменения состояния мониторов"""
         if not monitor:
-            log("⚠️  Попытка переместить окно на None монитор, пропускаем")
+            log("⚠️  Нет доступных или готовых мониторов. Скрываем окно.")
+            self.window.hide()
             return
 
-        # Получаем имя монитора
         monitor_name = self.monitor_manager.get_monitor_identifier(monitor)
-        log(f"📺 Перемещение на монитор: {monitor_name}")
+        log(f"📺 Монитор для окна: {monitor_name}")
 
-        # Загружаем сохраненные координаты центра окна для этого монитора
-        rel_center_x, rel_center_y = self.config.window.load_position(monitor_name)
+        # Показываем окно если было скрыто
+        if not self.window.get_visible():
+            self.window.show_all()
 
-        # Получаем размеры окна
-        window_width, window_height = self._get_window_size()
+        # Загружаем позицию ПЕРЕД диспатчем, чтобы передать её в MonitorChanged
+        rel_x, rel_y = WindowPositionPersistence.load_position(monitor_name)
+        self.store.dispatch(MonitorChanged(monitor_name=monitor_name, rel_x=rel_x, rel_y=rel_y))
 
-        # Вычисляем абсолютную позицию (margins для TOP+RIGHT anchors)
-        margin_right, margin_top = self.monitor_manager.calculate_absolute_position(
-            rel_center_x, rel_center_y, window_width, window_height, monitor
-        )
 
-        # Применяем позицию
-        self.window_x = margin_right
-        self.window_y = margin_top
-        GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.TOP, int(margin_top))
-        GtkLayerShell.set_margin(self.window, GtkLayerShell.Edge.RIGHT, int(margin_right))
-
-        # Запоминаем текущий монитор
-        self.current_monitor_name = monitor_name
-
-        # Показываем окно, если оно было скрыто
-        self.window.show_all()
-        log(f"✅ Окно перемещено на монитор {monitor_name}")
 
 
 def main():
