@@ -1,1 +1,7 @@
+numpy
+sounddevice
+onnx-asr
 httpx
+python-dotenv
+pyclip
+PyGObject

@@ -20,6 +20,11 @@ import shutil
 import shlex
 import httpx
 import gi
+from dotenv import load_dotenv
+
+# Загружаем переменные из .env файла, если он существует
+load_dotenv()
+
 from enum import Enum
 from typing import Callable, Optional, Protocol, Union, List
 from dataclasses import dataclass, replace
@@ -1040,13 +1045,34 @@ class PostProcessingProtocol(Protocol):
 # КОНФИГУРАЦИЯ И КОНСТАНТЫ
 # ============================================================================
 
+def get_env_bool(name: str, default: bool) -> bool:
+    """Получает булево значение из переменной окружения"""
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.lower() in ("true", "1", "yes", "on")
+
+def get_env_int(name: str, default: int) -> int:
+    """Получает целое число из переменной окружения"""
+    try:
+        return int(os.environ.get(name, default))
+    except (ValueError, TypeError):
+        return default
+
+def get_env_float(name: str, default: float) -> float:
+    """Получает число с плавающей точкой из переменной окружения"""
+    try:
+        return float(os.environ.get(name, default))
+    except (ValueError, TypeError):
+        return default
+
 class AudioConfig:
     """Настройки для аудио записи и распознавания"""
-    SAMPLE_RATE = 16000
-    CHANNELS = 1
+    SAMPLE_RATE = get_env_int("FSTT_WAV_SAMPLE_RATE", 16000)
+    CHANNELS = get_env_int("FSTT_WAV_CHANNELS", 1)
     DTYPE = 'int16'
     SAMPLE_WIDTH = 2
-    MODEL_NAME = "gigaam-v3-e2e-rnnt"
+    MODEL_NAME = os.environ.get("FSTT_ONNX_ASR_MODEL", "gigaam-v3-e2e-rnnt")
     WAV_FILE = "recording.wav"
 
 
@@ -1107,26 +1133,24 @@ button:disabled {
 class AppSettings:
     """Настройки поведения приложения"""
     APP_ID = 'com.example.voice_recognition'
-    COPY_METHOD = "clipboard"  # "primary", "clipboard"
-    AUTO_PASTE = True
-    LLM_ENABLED = True
-    LLM_PROMPT_FILE = "prompt.md"
-    LLM_TEMPERATURE = 1.0
-    LLM_MAX_RETRIES = 2
-    LLM_TIMEOUT_SEC = 60
-    SMART_TEXT_PROCESSING = False  # Включает умную обработку текста (короткие/длинные фразы)
-    SMART_TEXT_SHORT_PHRASE = 3  # Максимальное количество слов для постобработки обработки коротких фраз
+    COPY_METHOD = os.environ.get("FSTT_CLIPBOARD_COPY_METHOD", "clipboard")  # варианты: "primary", "clipboard"
+    AUTO_PASTE = get_env_bool("FSTT_CLIPBOARD_PASTE_ENABLED", True)
+    LLM_ENABLED = get_env_bool("FSTT_LLM_ENABLED", True)
+    LLM_PROMPT_FILE = os.environ.get("FSTT_LLM_PROMPT_FILE", "prompt.md")
+    LLM_TEMPERATURE = get_env_float("FSTT_LLM_TEMPERATURE", 1.0)
+    LLM_MAX_RETRIES = get_env_int("FSTT_LLM_MAX_RETRIES", 2)
+    LLM_TIMEOUT_SEC = get_env_int("FSTT_LLM_TIMEOUT_SEC", 60)
+    SMART_TEXT_PROCESSING = get_env_bool("FSTT_POSTPROCESSING_ENABLED", False)  # Включает умную обработку текста (короткие/длинные фразы)
+    SMART_TEXT_SHORT_PHRASE = get_env_int("FSTT_POSTPROCESSING_WORD_TRESHOLD", 3)  # Максимальное количество слов для постобработки обработки коротких фраз
 
-    # OpenAI settings from environment
+    # Настройки OpenAI из переменных окружения
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-#    OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai")
-#    OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gemini-2.5-flash")
     OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
     OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
     # Таймауты и задержки
-    PASTE_DELAY_MS = 200
-    RESTART_DELAY_SEC = 0.1
+    PASTE_DELAY_MS = get_env_int("FSTT_CLIPBOARD_PASTE_DELAY_MS", 200)
+    RESTART_DELAY_SEC = get_env_float("FSTT_RECORD_RESTART_DELAY_SEC", 0.1)
 
 
 class WindowPositionPersistence:
