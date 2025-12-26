@@ -21,7 +21,7 @@ import shlex
 import httpx
 import gi
 from enum import Enum
-from typing import Callable, Optional, Protocol, Dict, Set, Union, List
+from typing import Callable, Optional, Protocol, Union, List
 from dataclasses import dataclass, replace
 
 gi.require_version('Gtk', '3.0')
@@ -715,7 +715,6 @@ class MonitorManager:
     def __init__(self):
         self.display = None
         self.last_monitor_name = None
-        self.monitoring_enabled = False
         self.monitors_available = True
 
     def get_monitor_at_cursor(self) -> Optional[Gdk.Monitor]:
@@ -958,7 +957,7 @@ class MonitorManager:
     def start_monitoring(self, display: Gdk.Display, on_monitor_changed: Callable):
         """Запускает мониторинг изменений конфигурации дисплеев"""
         self.display = display
-        self.monitoring_enabled = True
+        pass
 
         # Подписываемся на изменения конфигурации мониторов
         display.connect("monitor-added", lambda d, m: on_monitor_changed(d, m))
@@ -1251,13 +1250,7 @@ class WindowPositionPersistence:
         """
         return (int(UIConfig.DEFAULT_WINDOW_X), int(UIConfig.DEFAULT_WINDOW_Y))
 
-    @classmethod
-    def save(cls, x: int, y: int) -> None:
-        """
-        Устаревший метод для обратной совместимости
-        Ничего не делает, используйте save_position() вместо этого
-        """
-        pass
+
 
 
 
@@ -1554,7 +1547,7 @@ class SpeechService:
 
     def _init_stream(self):
         """Инициализирует и запускает постоянно работающий поток"""
-        def callback(indata, frames, time, status):
+        def callback(indata, _frames, time, status):
             if status:
                 log(f"⚠️  Статус: {status}")
 
@@ -1736,15 +1729,7 @@ class AsyncTaskRunner:
     # Режим работы: True для синхронного выполнения (для тестов), False для асинхронного (продакшн)
     _sync_mode = False
 
-    @classmethod
-    def set_sync_mode(cls, enabled: bool) -> None:
-        """
-        Включает/выключает синхронный режим (полезно для тестирования)
 
-        Args:
-            enabled: True для синхронного выполнения, False для асинхронного
-        """
-        cls._sync_mode = enabled
 
     @classmethod
     def run_async(cls, target: Callable, callback: Callable[[any], None]) -> None:
@@ -1938,7 +1923,7 @@ class RecognitionWindow:
             self.pp_button.set_label(icon)
 
 
-    def on_button_press(self, widget, event):
+    def on_button_press(self, _widget, event):
         """Обработчик начала перетаскивания"""
         if event.button == self.config.ui.MOUSE_BUTTON_LEFT:
             self.is_dragging = True
@@ -1946,7 +1931,7 @@ class RecognitionWindow:
             self.drag_start_x = event.x_root
             self.drag_start_y = event.y_root
 
-    def on_button_release(self, widget, event):
+    def on_button_release(self, _widget, event):
         """Обработчик окончания перетаскивания"""
         if event.button == self.config.ui.MOUSE_BUTTON_LEFT:
             self.is_dragging = False
@@ -1968,7 +1953,7 @@ class RecognitionWindow:
                     self.current_monitor_name = monitor_name
             self.was_moved = False
 
-    def on_motion_notify(self, widget, event):
+    def on_motion_notify(self, _widget, event):
         """Обработчик перемещения мыши при перетаскивании"""
         if self.is_dragging:
             # Вычисляем смещение
@@ -2111,9 +2096,9 @@ class RecognitionWindow:
 
         if width <= 1 or height <= 1:
             # Если окно еще не отрисовано или скрыто, запрашиваем желаемый размер
-            min_size, nat_size = self.window.get_preferred_size()
-            width = nat_size.width
-            height = nat_size.height
+            _min_size, pref_size = self.window.get_preferred_size()
+            width = pref_size.width
+            height = pref_size.height
             log(f"📐 Окно не отрисовано, используем preferred size: {width}x{height}")
         
         return width, height
@@ -2347,7 +2332,7 @@ def main():
     app.connect('activate', recognition_window.on_activate)
 
     # Обработчик Ctrl+C для корректного завершения
-    def signal_handler(sig, frame):
+    def signal_handler(_sig, _frame):
         log("\n⚠️  Получен сигнал прерывания (Ctrl+C)")
         log("🛑 Останавливаю приложение...")
 
