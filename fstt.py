@@ -280,14 +280,14 @@ class Reducer:
             if action.rel_x is not None and action.rel_y is not None:
                 return replace(state, rel_x=action.rel_x, rel_y=action.rel_y)
             return state
-        
+
         # Если при смене монитора переданы координаты - применяем их сразу
         if action.rel_x is not None and action.rel_y is not None:
-            return replace(state, 
+            return replace(state,
                            current_monitor_name=action.monitor_name,
                            rel_x=action.rel_x,
                            rel_y=action.rel_y)
-            
+
         return replace(state, current_monitor_name=action.monitor_name)
 
     @staticmethod
@@ -459,7 +459,7 @@ class ASREffect:
         """Обработка UIStop действия"""
         if isinstance(action, UIStop) and prev.phase == Phase.RECORDING and next.phase == Phase.PROCESSING:
             session = next.session_id
-            log(f"🔄 Остановка записи и распознавание (session {session})...")
+            log("🔄 Остановка записи и распознавание...")
 
             def task():
                 try:
@@ -471,6 +471,8 @@ class ASREffect:
 
             def done(result):
                 text, err = result
+                if text:
+                    log(f"📝 Распознанный текст: {text}")
                 dispatch(ASRDone(session_id=session, text=text, error=err))
 
             self.async_runner.run_async(task, done)
@@ -509,7 +511,7 @@ class LLMEffect:
             return
 
         session = next.session_id
-        log(f"🤖 Запуск LLM обработки (session {session})...")
+        log("🤖 Запуск LLM обработки...")
 
         def task():
             try:
@@ -521,6 +523,8 @@ class LLMEffect:
 
         def done(result):
             text, err = result
+            if text:
+                log(f"✨ Обработанный текст: {text}")
             dispatch(LLMDone(session_id=session, text=text, error=err))
 
         self.async_runner.run_async(task, done)
@@ -577,7 +581,7 @@ class FinalizeEffect:
         else:
             self.clipboard.copy_primary(text)
 
-        log(f"📋 Текст скопирован ({state.copy_method}): {text[:50]}...")
+        log(f"📋 Текст скопирован ({state.copy_method})")
 
         # Автовставка если включена
         if state.auto_paste:
@@ -591,7 +595,7 @@ class FinalizeEffect:
         # Случай 1: ASRDone + LLM выключен => финализировать распознанным текстом
         if isinstance(action, ASRDone) and action.session_id == next.session_id and not next.llm_enabled:
             if action.text and next.phase == Phase.IDLE:
-                log(f"✅ Финализация после ASR (session {action.session_id}, без LLM)")
+                log("✅ Финализация после ASR (без LLM)")
                 text = self.smart_process(next, action.text)
                 self.copy_paste(next, text)
             return
@@ -602,11 +606,11 @@ class FinalizeEffect:
                 # Использовать обработанный текст если доступен, иначе fallback на распознанный
                 base = action.text or next.recognized_text
                 if base:
-                    log(f"✅ Финализация после LLM (session {action.session_id})")
+                    log("✅ Финализация после LLM")
                     text = self.smart_process(next, base)
                     self.copy_paste(next, text)
                 else:
-                    log(f"⚠️  Нет текста для финализации (session {action.session_id})")
+                    log("⚠️  Нет текста для финализации")
 
 
 class RestartEffect:
@@ -636,7 +640,7 @@ class RestartEffect:
         """Обработка UIRestart действия"""
         if isinstance(action, UIRestart) and prev.phase == Phase.RECORDING and next.phase == Phase.RESTARTING:
             session = next.session_id
-            log(f"🔄 Перезапуск записи (session {session})...")
+            log("🔄 Перезапуск записи...")
 
             def task():
                 try:
@@ -1864,8 +1868,8 @@ class PostProcessingService:
                         json={
                             "model": self.config.settings.OPENAI_MODEL,
                             "messages": [
-                                {"role": "system", "content": self.prompt},
-                                {"role": "user", "content": text},
+                                {"role": "user", "content": self.prompt},
+                                {"role": "user", "content": f"<user_input>{text}</user_input>"},
                             ],
                             "temperature": self.config.settings.LLM_TEMPERATURE,
                         },
@@ -1894,9 +1898,7 @@ class PostProcessingService:
         return text
 
 
-# ============================================================================
-# КОНТРОЛЛЕР ПРИЛОЖЕНИЯ (БИЗНЕС-ЛОГИКА)
-# ============================================================================
+
 
 class AsyncTaskRunner:
     """Управляет выполнением асинхронных задач в фоновых потоках"""
