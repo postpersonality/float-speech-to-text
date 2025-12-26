@@ -418,7 +418,6 @@ class StartRecordingEffect:
     def handle(self, action: Action, prev: State, next: State, dispatch: Callable) -> None:
         """Обработка UIStart действия"""
         if isinstance(action, UIStart) and prev.phase == Phase.IDLE and next.phase == Phase.RECORDING:
-            log("🎙️  Запуск записи...")
             ok = self.speech.start()
             if not ok:
                 log("❌ Не удалось запустить запись")
@@ -449,7 +448,6 @@ class ASREffect:
     def handle(self, action: Action, prev: State, next: State, dispatch: Callable) -> None:
         """Обработка UIStop действия"""
         if isinstance(action, UIStop) and prev.phase == Phase.RECORDING and next.phase == Phase.PROCESSING:
-            log("🔄 Остановка записи и распознавание...")
 
             def task():
                 try:
@@ -461,8 +459,6 @@ class ASREffect:
 
             def done(result):
                 text, err = result
-                if text:
-                    log(f"📝 Распознанный текст: {text}")
                 dispatch(ASRDone(text=text, error=err))
 
             self.async_runner.run_async(task, done)
@@ -498,7 +494,6 @@ class LLMEffect:
         if not action.text:
             return
 
-        log("🤖 Запуск LLM обработки...")
 
         def task():
             try:
@@ -510,8 +505,6 @@ class LLMEffect:
 
         def done(result):
             text, err = result
-            if text:
-                log(f"✨ Обработанный текст: {text}")
             dispatch(LLMDone(text=text, error=err))
 
         self.async_runner.run_async(task, done)
@@ -567,8 +560,6 @@ class FinalizeEffect:
             self.clipboard.copy_standard(text)
         else:
             self.clipboard.copy_primary(text)
-
-        log(f"📋 Текст скопирован ({state.copy_method})")
 
         # Автовставка если включена
         if state.auto_paste:
@@ -1018,7 +1009,7 @@ class MonitorManager:
         margin_right = max(0, min(monitor_width - window_width, margin_right))
         margin_top = max(0, min(monitor_height - window_height, margin_top))
 
-        log(f"🧮 Абсолютная позиция: margin_right={int(margin_right)}, margin_top={int(margin_top)}")
+
 
         return (int(margin_right), int(margin_top))
 
@@ -1821,6 +1812,8 @@ class SpeechService:
 
         try:
             text = self.model.recognize(self.config.audio.WAV_FILE)
+            if text:
+                log(f"📝 Распознано: {text}")
             return text
         except Exception as e:
             log(f"❌ Ошибка распознавания: {e}")
@@ -1864,7 +1857,7 @@ class PostProcessingService:
                     result = response.json()
 
                     processed_text = result["choices"][0]["message"]["content"].strip()
-                    log(f"✅ LLM вернул обработанный текст: {processed_text}")
+                    log(f"✅ LLM ({self.config.settings.OPENAI_MODEL}) обработал: {processed_text}")
                     return processed_text
 
             except (httpx.RequestError, httpx.HTTPStatusError) as e:
