@@ -1234,7 +1234,8 @@ button {
     border-radius: 5px;
     border: none;
     font-size: 20px;
-    padding: 5px 10px;
+    padding: 5px 0px;
+    min-width: 35px;
 }
 button:hover {
     background-color: rgba(60, 60, 60, 0.3);
