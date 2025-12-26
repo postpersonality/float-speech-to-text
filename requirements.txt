@@ -1,7 +1,8 @@
-numpy
-sounddevice
-onnx-asr
-httpx
-python-dotenv
-pyclip
-PyGObject
+numpy==2.4.0
+sounddevice==0.5.3
+onnx-asr==0.10.0
+httpx==0.28.1
+python-dotenv==1.2.1
+pyclip==0.7.0
+PyGObject==3.54.5
+onnxruntime==1.23.2
