@@ -71,10 +71,6 @@ class State:
     processed_text: Optional[str] = None
     error: Optional[str] = None
 
-    # Защита от конкурентности - инкрементируется при каждой новой сессии
-    # Используется для игнорирования результатов устаревших async операций
-    session_id: int = 0
-
     # Связанное с интерфейсом
     current_monitor_name: Optional[str] = None
     rel_x: float = 0.5  # Относительная позиция центра (0.0 - 1.0)
@@ -110,7 +106,6 @@ class UIToggleLLM:
 @dataclass(frozen=True)
 class ASRDone:
     """ASR (распознавание речи) завершено"""
-    session_id: int
     text: Optional[str]
     error: Optional[str] = None
 
@@ -118,7 +113,6 @@ class ASRDone:
 @dataclass(frozen=True)
 class LLMDone:
     """LLM пост-обработка завершена"""
-    session_id: int
     text: Optional[str]
     error: Optional[str] = None
 
@@ -126,7 +120,6 @@ class LLMDone:
 @dataclass(frozen=True)
 class RestartDone:
     """Перезапуск записи завершён"""
-    session_id: int
     success: bool
     error: Optional[str] = None
 
@@ -177,8 +170,7 @@ class Reducer:
             phase=Phase.RECORDING,
             error=None,
             recognized_text=None,
-            processed_text=None,
-            session_id=state.session_id + 1
+            processed_text=None
         )
 
     @staticmethod
@@ -205,8 +197,8 @@ class Reducer:
     @staticmethod
     def handle_asr_done(state: State, action: ASRDone) -> State:
         """ASR завершено с текстом или ошибкой"""
-        # Игнорируем устаревшие результаты
-        if action.session_id != state.session_id:
+        # Игнорируем результаты, если мы уже не в фазе PROCESSING
+        if state.phase != Phase.PROCESSING:
             return state
 
         # Обрабатываем ошибку или пустой текст
@@ -229,8 +221,8 @@ class Reducer:
     @staticmethod
     def handle_llm_done(state: State, action: LLMDone) -> State:
         """LLM пост-обработка завершена"""
-        # Игнорируем устаревшие результаты
-        if action.session_id != state.session_id:
+        # Игнорируем результаты, если мы уже не в фазе POST_PROCESSING
+        if state.phase != Phase.POST_PROCESSING:
             return state
 
         # Обрабатываем ошибку или пустой текст
@@ -254,8 +246,8 @@ class Reducer:
     @staticmethod
     def handle_restart_done(state: State, action: RestartDone) -> State:
         """Перезапуск записи завершён"""
-        # Игнорируем устаревшие результаты
-        if action.session_id != state.session_id:
+        # Игнорируем результаты, если мы уже не в фазе RESTARTING
+        if state.phase != Phase.RESTARTING:
             return state
 
         if action.success:
@@ -431,7 +423,6 @@ class StartRecordingEffect:
             if not ok:
                 log("❌ Не удалось запустить запись")
                 dispatch(ASRDone(
-                    session_id=next.session_id,
                     text=None,
                     error="failed to start recording"
                 ))
@@ -458,7 +449,6 @@ class ASREffect:
     def handle(self, action: Action, prev: State, next: State, dispatch: Callable) -> None:
         """Обработка UIStop действия"""
         if isinstance(action, UIStop) and prev.phase == Phase.RECORDING and next.phase == Phase.PROCESSING:
-            session = next.session_id
             log("🔄 Остановка записи и распознавание...")
 
             def task():
@@ -473,7 +463,7 @@ class ASREffect:
                 text, err = result
                 if text:
                     log(f"📝 Распознанный текст: {text}")
-                dispatch(ASRDone(session_id=session, text=text, error=err))
+                dispatch(ASRDone(text=text, error=err))
 
             self.async_runner.run_async(task, done)
 
@@ -498,10 +488,8 @@ class LLMEffect:
 
     def handle(self, action: Action, prev: State, next: State, dispatch: Callable) -> None:
         """Обработка ASRDone действия"""
-        # Срабатываем только на ASRDone для текущей сессии
+        # Срабатываем только на ASRDone
         if not isinstance(action, ASRDone):
-            return
-        if action.session_id != next.session_id:
             return
 
         # Только если LLM включён и есть текст
@@ -510,7 +498,6 @@ class LLMEffect:
         if not action.text:
             return
 
-        session = next.session_id
         log("🤖 Запуск LLM обработки...")
 
         def task():
@@ -525,7 +512,7 @@ class LLMEffect:
             text, err = result
             if text:
                 log(f"✨ Обработанный текст: {text}")
-            dispatch(LLMDone(session_id=session, text=text, error=err))
+            dispatch(LLMDone(text=text, error=err))
 
         self.async_runner.run_async(task, done)
 
@@ -593,7 +580,7 @@ class FinalizeEffect:
         """Обработка триггеров финализации"""
 
         # Случай 1: ASRDone + LLM выключен => финализировать распознанным текстом
-        if isinstance(action, ASRDone) and action.session_id == next.session_id and not next.llm_enabled:
+        if isinstance(action, ASRDone) and not next.llm_enabled:
             if action.text and next.phase == Phase.IDLE:
                 log("✅ Финализация после ASR (без LLM)")
                 text = self.smart_process(next, action.text)
@@ -601,7 +588,7 @@ class FinalizeEffect:
             return
 
         # Случай 2: LLMDone => финализировать обработанным текстом (или fallback)
-        if isinstance(action, LLMDone) and action.session_id == next.session_id:
+        if isinstance(action, LLMDone):
             if next.phase == Phase.IDLE:
                 # Использовать обработанный текст если доступен, иначе fallback на распознанный
                 base = action.text or next.recognized_text
@@ -639,7 +626,6 @@ class RestartEffect:
     def handle(self, action: Action, prev: State, next: State, dispatch: Callable) -> None:
         """Обработка UIRestart действия"""
         if isinstance(action, UIRestart) and prev.phase == Phase.RECORDING and next.phase == Phase.RESTARTING:
-            session = next.session_id
             log("🔄 Перезапуск записи...")
 
             def task():
@@ -660,7 +646,7 @@ class RestartEffect:
 
             def done(result):
                 ok, err = result
-                dispatch(RestartDone(session_id=session, success=ok, error=err))
+                dispatch(RestartDone(success=ok, error=err))
 
             self.async_runner.run_async(task, done)
 
